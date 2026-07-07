@@ -3,7 +3,7 @@
 A drop-in folder that makes **Claude Code** and **Codex (OpenAI CLI)**
 pressure-test each other's work automatically: one model plans/reviews while the
 other implements, with real multi-round discussion and **zero manual
-copy-paste**. Fully portable — no project-specific paths.
+copy-paste**.
 
 ## What you get
 
