@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: |
+          for f in codex-bridge/*.sh install.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1091: sourced files resolved at runtime next to the script.
+          shellcheck -x -e SC1091 codex-bridge/*.sh install.sh
+
+      - name: bats unit tests
+        run: |
+          sudo apt-get install -y -qq bats
+          bats tests/

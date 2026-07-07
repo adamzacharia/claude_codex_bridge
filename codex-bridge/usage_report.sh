@@ -4,9 +4,11 @@
 #   bash codex-bridge/usage_report.sh                 # every task + grand totals
 #   bash codex-bridge/usage_report.sh build-01-rag    # one task's breakdown
 #
-# Reads the per-task ledgers at tmp/codex/tasks/<id>/usage.tsv. (Codex figures are
-# captured per call; Claude figures are captured only for headless `claude -p`
-# turns in --auto duels — interactive Claude in build/guard isn't measurable here.)
+# Reads the per-task ledgers at tmp/codex/tasks/<id>/usage.tsv. Codex figures
+# are captured per call (from the --json event stream when available); headless
+# `claude -p` turns record themselves; the INTERACTIVE Claude Code session is
+# recorded by running `bash codex-bridge/claude_usage.sh end <task-id>` when a
+# task is declared done.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
