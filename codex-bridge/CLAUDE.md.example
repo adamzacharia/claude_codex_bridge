@@ -1,0 +1,52 @@
+# Paste this into your repo's CLAUDE.md
+#
+# This is a generic snippet — copy the section below into your project's
+# CLAUDE.md (create the file at the repo root if it doesn't exist) so Claude
+# Code loads the Claude ↔ Codex protocol every session. Delete this header.
+
+## Claude ↔ Codex collaboration
+
+This repo uses the local **`codex-bridge/`** kit to make Claude and Codex
+pressure-test each other's work. **Read and follow `codex-bridge/PROTOCOL.md`**
+for all non-trivial work: get an independent second opinion from Codex before
+and/or during the work, and have the *other* model review the diff. Drive Codex
+hands-off — never make the user copy-paste.
+
+Mode keywords the user appends to a request (Claude maps → `codex_loop.sh`):
+
+| Keyword | Mode |
+|---|---|
+| `@cx-build` | `--mode build` — Codex implements; Claude reviews the diff |
+| `@cx-guard` | `--mode guard` — Claude implements; Codex reviews over threaded rounds |
+| `@cx-duel`  | `--mode duel`  — mutual-critique DEBATE loop; both answer + critique each round, converge. Read-only by default; me-driven (default) or `--auto` (needs `--seed`); `--code` to edit (Codex writes in a worktree, Claude reviews) |
+
+Append model / effort / speed after the keyword, e.g.
+`@cx-build gpt5.5 xhigh fast` → `--model gpt-5.5 --effort xhigh --fast`
+(normalize `gpt5.5`→`gpt-5.5`; effort ∈ low|medium|high|xhigh; `fast` = priority
+service tier). No keyword → Claude picks (build for non-trivial, inline for
+trivial) and says which. Persist Codex findings; fix or explicitly waive each.
+
+Duel tail words: `auto`→`--auto`, `code`→`--code`, bare integer `N`→`--rounds N`
+(default 4 rounds). `@cx-duel` defaults to me-driven + read-only and works for a
+plain question (no code needed). `--auto` REQUIRES `--seed seed.md` (a context
+bundle you write first) so the headless side never starts blind. In `--code`
+exactly one model writes (Codex in a worktree); Claude reviews read-only and the
+script never auto-merges to main. Effort applies to Codex as given; the Claude
+side has no `xhigh` and is clamped to `high`.
+
+```bash
+bash codex-bridge/codex_loop.sh --mode build  --test 'cmd' < spec.md
+bash codex-bridge/codex_loop.sh --mode guard  --base main
+bash codex-bridge/codex_loop.sh --mode duel   --step init < question.md   # me-driven: then --step codex per round, --step finalize
+bash codex-bridge/codex_loop.sh --mode duel   --auto --seed seed.md < question.md   # unattended debate; --teardown cleans up --code runs
+```
+
+Artifacts: `tmp/codex/tasks/<id>/`. NEVER let Codex read/print generated files
+(`.next/`, `dist/`, `build/`, compiled CSS) — reason on source only.
+
+**Token accounting (automatic):** every `codex_loop.sh` run prints a `TOKENS`
+breakdown in its SUMMARY and writes `usage.md`/`usage.tsv` per task. Report anytime
+with `bash codex-bridge/usage_report.sh [task-id]`. Codex is measured per call;
+Claude only for headless `claude -p` (`--auto` duels) — interactive Claude in
+build/guard isn't bridge-measurable. After any `@cx` task, summarize the
+Codex-vs-Claude split for the user. See `codex-bridge/PROTOCOL.md` → "Token accounting".

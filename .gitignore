@@ -1,0 +1,3 @@
+# Codex ↔ Claude bridge runtime artifacts
+tmp/codex/
+codex-bridge/tmp/

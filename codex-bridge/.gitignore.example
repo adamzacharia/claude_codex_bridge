@@ -1,0 +1,4 @@
+# Codex ↔ Claude bridge runtime artifacts — add these to your repo's .gitignore.
+# (The kit writes per-task scratch/logs/token ledgers here; nothing to commit.)
+tmp/codex/
+codex-bridge/tmp/
