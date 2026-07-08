@@ -5,7 +5,7 @@ pressure-test each other's work automatically: one model plans/reviews while the
 other implements, with real multi-round discussion and **zero manual
 copy-paste**.
 
-## 🚀 Don't want to read anything? Let Claude install it for you
+## Don't want to read anything? Let Claude install it for you
 
 Download (or clone) this repo, open **Claude Code**, fill in the two paths, and
 paste this prompt — Claude does the entire setup and verifies it:
