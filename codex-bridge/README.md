@@ -33,6 +33,37 @@ copy-paste**. Fully portable — no project-specific paths.
 - **Full token accounting** — Codex per call, headless Claude per call, and the
   interactive Claude Code session via `claude_usage.sh end <task>`.
 
+## 🚀 Don't want to read anything? Let Claude install it for you
+
+Fill in the two paths and paste this into **Claude Code** — it does the entire
+setup and verifies it:
+
+```text
+I downloaded the claude_codex_bridge repo to:  <PATH-TO-THE-DOWNLOADED-FOLDER>
+Install the Claude↔Codex bridge into my repo:  <PATH-TO-MY-REPO>
+
+Do the complete setup:
+1. Copy the codex-bridge/ folder from the downloaded repo into the ROOT of my
+   repo (overwrite any older copy of the kit's files; do NOT copy tmp/, tests/,
+   or .github/ — those are not part of the kit).
+2. Add the collaboration section to my repo's CLAUDE.md (create the file if
+   missing) using codex-bridge/CLAUDE.md.example as the template (drop the
+   template's comment header). Detect my repo's default branch — if it is not
+   "main", add a bold line saying to ALWAYS pass --base <that-branch>.
+3. Append the lines from codex-bridge/.gitignore.example to my repo's
+   .gitignore (idempotently). Ask me whether I want the codex-bridge/ folder
+   itself committed (team-friendly) or gitignored (local-only), and wire it.
+4. Check ~/.codex/config.toml against codex-bridge/SETUP.md section 4 — on
+   Windows make sure it has [windows] sandbox = "unelevated" — and fix it.
+5. Run: bash codex-bridge/doctor.sh   and fix anything that FAILs.
+6. Finish with a free smoke test from my repo root:
+   printf 'smoke test' | bash codex-bridge/codex_loop.sh --mode build --dry-run
+   Then show me, in 5 lines, how I trigger @cx-build, @cx-guard and @cx-duel.
+```
+
+Prefer to understand what that does? Read on — the manual steps below are the
+same thing.
+
 ## Install: exactly what to copy, exactly what to edit
 
 ### 1. COPY — one folder, nothing else
