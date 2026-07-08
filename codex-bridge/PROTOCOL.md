@@ -130,26 +130,45 @@ clamped to `high`.
 ## What each mode runs
 
 - **build**: consult (Codex critiques the spec, proposes changes, asks Claude
-  questions) → build (Codex edits, threaded; answers its own open questions and
-  says which assumptions it chose) → **test + fix loop** (`--test '<cmd>'`; a red
-  test's output is fed back to the SAME Codex thread for up to `--fix-rounds N`
-  repair rounds, default 2) → self-review (`codex exec review --uncommitted`,
-  advisory) → **`--claude-review`**: a scripted headless-Claude cross-review of
-  the diff (the *other* model, per the Principle) whose CX-NN findings go BACK to
-  the Codex thread for a **fix-or-rebut round**, then a final re-test.
-- **guard**: gate on `git status --porcelain` → round 1 review (fresh consult,
-  Codex inspects the uncommitted diff; pass `--spec <file>` to give the reviewer
-  the change INTENT — an intent-blind reviewer can't catch "does X but Y was
-  required") → round 2 findings as a **CX-NN reconciliation ledger** (threaded
-  `--resume`) → Claude writes `reconciliation.md` (`CX-NN: FIXED — …` or
-  `CX-NN: WAIVED — …` for EVERY finding) → **`--task <id> --step verify`**:
-  Codex, on the SAME thread, re-checks each fix in the current diff, AGREEs or
-  CONTESTs each waiver, flags regressions, and ends `VERDICT: CLEAN` or
-  `VERDICT: REOPEN CX-…`. Loop verify until CLEAN (or explicitly overrule).
-- **duel**: a continuous mutual-critique **debate loop**. **Round 0 is
-  INDEPENDENT** — neither side sees the other's opening answer, so their errors
-  stay uncorrelated; cross-critique starts at round 1, and `CONVERGED` is only
-  honored from round 1 on (both sides in the same round). Two ways to run it:
+  questions — with a repo map + spec-referenced file excerpts packed into the
+  prompt) → **plan gate** (headless Claude answers every question and rules
+  ACCEPT/REJECT on each spec change BEFORE any code exists; `--no-plan-gate`
+  disables; `--author-tests` additionally has Claude write acceptance tests the
+  implementation must pass unchanged) → build (Codex edits, threaded, following
+  the rulings) → **test + fix loop** (`--test '<cmd>'`; up to `--fix-rounds N`,
+  default 2, with a bonus cheap high-effort round for shallow error classes, an
+  unchanged-failure **stall detector** that pulls an independent Claude
+  diagnosis, and early stop when retrying is pointless) → **parallel reviews**:
+  a spec-aware structured Codex self-review (custom instructions + CX grammar
+  via `codex exec review - < …`) runs concurrently with the `--claude-review`
+  headless-Claude cross-review → both findings lists (CX + SX) go BACK to the
+  Codex thread for a **fix-or-rebut round** → the cross-reviewer then RESUMES
+  its own session to refute each `FIXED` claim (`VERDICT: CLEAN|REOPEN`, one
+  scoped reopen round) → final re-test. `--quick` merges consult+build into one
+  call for small mechanical specs.
+- **guard**: optional `--test` runs BEFORE the review (a red test is the
+  reviewer's strongest lead; the result persists in `guard.env` as the
+  regression baseline) → round 1 review (fresh consult; pass `--spec <file>`
+  for the change INTENT) → round 2 findings as a **CX-NN reconciliation
+  ledger**, mechanically LINTED (grammar, real file:line refs, TOTAL count; one
+  reformat nudge on violations) → Claude writes `reconciliation.md` — the
+  verify step REFUSES to run until every CX id has a ruling → **`--task <id>
+  --step verify`**: the test re-runs (red/green transition shown to the
+  verifier), Codex re-checks each fix on the SAME thread, AGREEs or CONTESTs
+  each waiver, and ends `VERDICT: CLEAN` or `VERDICT: REOPEN CX-…` (one nudge
+  if the verdict line is missing). Loop verify until CLEAN.
+- **duel**: a continuous mutual-critique **debate loop** with machine-checked
+  honesty: both sides maintain a **DX disagreement ledger** (`- DX-NN |
+  OPEN|AGREED|CONCEDED-* | point | evidence: …`) — convergence requires the
+  `CONVERGED` token AND zero OPEN points, silently dropped points are nudged
+  back, and identical OPEN sets two rounds running hand the debate to the
+  arbiter early; every `EVIDENCE: <path>:<line> "<quote>"` citation is
+  **mechanically verified** after each turn and failures are flagged to the
+  counterpart as unproven. **Round 0 is INDEPENDENT and runs both sides in
+  parallel**; cross-critique starts at round 1 (default cap: 3 rounds —
+  research shows gains plateau by then). The FIRST convergence triggers one
+  mandatory **red-team exchange** (attack the consensus; re-converging after a
+  failed attack ends the debate as `converged-post-redteam`). Two ways to run:
   - **default (me-driven)**: the live Claude session IS the Claude debater (full
     repo + chat context). Step it: `--step init` (sets up, persists ALL flags to
     `duel.env` — later steps only need `--task <id>`), then each round write your
@@ -163,10 +182,13 @@ clamped to `high`.
     live Claude writes (its research + relevant repo/chat context) so neither side
     starts blind. Converges when both sides emit `CONVERGED` in the same round
     (round ≥ 1), else stops at `--rounds`.
-  On non-convergence a **fresh-context arbiter** (a NEW Codex session with no
-  debate history and no stake) rules on each remaining disagreement with
-  checkable evidence; the final synthesis weighs its rulings (`--no-arbiter`
-  disables). `final.md` always lists any UNRESOLVED points.
+  On non-convergence a **two-model arbiter PANEL** (fresh Codex + fresh Claude,
+  no debate history, ruling in parallel on an ANONYMIZED docket — position
+  labels only, since identity/verbosity measurably skew judges) rules on each
+  remaining disagreement with checkable evidence; where the two rulings agree
+  the synthesis treats them as binding, where they disagree the point lands
+  under UNRESOLVED with both rulings shown (`--no-arbiter` disables).
+  `final.md` always lists any UNRESOLVED points.
   Read-only by default — works for a plain question. `--code` opts into edits
   with a **single writer**: Codex edits in a `git worktree` ONLY (the loop
   refuses to run Codex writable outside it), Claude reviews the diff read-only;
@@ -188,10 +210,10 @@ clamped to `high`.
 
 ## Token accounting (automatic)
 
-Every `codex_loop.sh` run records token usage per call and prints a `TOKENS`
-breakdown in its SUMMARY, plus writes `tmp/codex/tasks/<id>/usage.md`. Raw rows
-go to `tmp/codex/tasks/<id>/usage.tsv`
-(`epoch  iso  side  model  label  total  in  cached  out  rc`).
+Every `codex_loop.sh` run records token usage AND per-call wall-clock per call
+and prints a `TOKENS` breakdown (with time totals) in its SUMMARY, plus writes
+`tmp/codex/tasks/<id>/usage.md`. Raw rows go to `tmp/codex/tasks/<id>/usage.tsv`
+(`epoch  iso  side  model  label  total  in  cached  out  rc  secs`).
 
 - **Codex** is captured per call from the `--json` event stream
   (`turn.completed.usage`: real in/cached/out splits; older CLIs fall back to

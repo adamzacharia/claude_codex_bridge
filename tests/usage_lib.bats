@@ -93,3 +93,17 @@ EOF
   run usage_report "$TMP/none.tsv"
   [[ "$output" == *"no token usage recorded"* ]]
 }
+
+@test "ledger v3: duration column recorded and rendered as time totals" {
+  usage_record "$TMP/v3.tsv" codex gpt-5.5 consult 175 100 50 25 0 125
+  run usage_report "$TMP/v3.tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"2m05s"* ]]
+  [[ "$output" == *"Codex total:"*"175"*"(2m05s)"* ]]
+}
+
+@test "ledger v3: rows without duration render a dash" {
+  usage_record "$TMP/v3b.tsv" codex gpt-5.5 consult 10 5 3 2 0
+  run usage_report "$TMP/v3b.tsv"
+  [[ "$output" == *" - "* ]]
+}

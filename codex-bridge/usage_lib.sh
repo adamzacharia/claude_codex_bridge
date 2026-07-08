@@ -5,12 +5,12 @@
 # Every Codex or Claude invocation appends one row to a per-task ledger (TSV);
 # the report renders a per-step breakdown plus per-side and per-model totals.
 #
-# Ledger v2 row (tab-separated, 10 columns):
-#   <epoch>  <iso-utc>  <side>  <model>  <label>  <total>  <in>  <cached>  <out>  <rc>
+# Ledger v3 row (tab-separated, 11 columns):
+#   <epoch>  <iso-utc>  <side>  <model>  <label>  <total>  <in>  <cached>  <out>  <rc>  <secs>
 # side ∈ {codex, claude}.  When the in/cached/out split is known, total is their
 # sum; otherwise total is the best single "tokens used" figure for the call and
-# the split columns are empty.  Ledgers written by older kit versions use the
-# 8-column v1 layout (no <model>/<cached>); usage_report renders both.
+# the split columns are empty.  <secs> is per-call wall-clock — the measurement
+# backbone for latency tuning.  Older ledgers (10-col v2, 8-col v1) still render.
 
 # ---------------------------------------------------------------------------
 # codex --json (JSONL event stream) parsers.
@@ -78,34 +78,34 @@ usage_extract_codex_tokens() {
 # Ledger writers
 # ---------------------------------------------------------------------------
 
-# Append one v2 usage row.
-# Args: ledger side model label total [in] [cached] [out] [rc]
+# Append one v3 usage row.
+# Args: ledger side model label total [in] [cached] [out] [rc] [secs]
 usage_record() {
   local ledger="$1" side="$2" model="$3" label="$4" total="${5:-}" \
-        in="${6:-}" cached="${7:-}" out="${8:-}" rc="${9:-0}"
+        in="${6:-}" cached="${7:-}" out="${8:-}" rc="${9:-0}" secs="${10:-}"
   [ -n "$ledger" ] || return 0
   mkdir -p "$(dirname "$ledger")" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%s 2>/dev/null || echo 0)" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')" \
-    "$side" "${model:--}" "$label" "${total:-0}" "$in" "$cached" "$out" "$rc" \
+    "$side" "${model:--}" "$label" "${total:-0}" "$in" "$cached" "$out" "$rc" "$secs" \
     >> "$ledger"
 }
 
 # Record one Codex call: prefer the JSONL usage event, fall back to the v1
-# "tokens used" log grep. Args: ledger label jsonl log rc model
+# "tokens used" log grep. Args: ledger label jsonl log rc model [secs]
 usage_record_codex() {
-  local ledger="$1" label="$2" jsonl="$3" log="$4" rc="${5:-0}" model="${6:-}"
+  local ledger="$1" label="$2" jsonl="$3" log="$4" rc="${5:-0}" model="${6:-}" secs="${7:-}"
   local split in cached out total
   split="$(codex_jsonl_usage "$jsonl")"
   if [ -n "$split" ]; then
     in="${split%% *}"; out="${split##* }"
     cached="${split#* }"; cached="${cached%% *}"
     total=$((in + cached + out))
-    usage_record "$ledger" codex "$model" "$label" "$total" "$in" "$cached" "$out" "$rc"
+    usage_record "$ledger" codex "$model" "$label" "$total" "$in" "$cached" "$out" "$rc" "$secs"
   else
     total="$(usage_extract_codex_tokens "$log")"
-    usage_record "$ledger" codex "$model" "$label" "${total:-0}" "" "" "" "$rc"
+    usage_record "$ledger" codex "$model" "$label" "${total:-0}" "" "" "" "$rc" "$secs"
   fi
 }
 
@@ -127,27 +127,34 @@ usage_report() {
   fi
   awk -F'\t' '
     {
-      if (NF >= 10) { side=$3; model=$4; label=$5; tot=$6+0; inp=$7; cch=$8; out=$9 }
-      else          { side=$3; model="-"; label=$4; tot=$5+0; inp=$6; cch="";  out=$7 }
+      secs="";
+      if (NF >= 11)     { side=$3; model=$4; label=$5; tot=$6+0; inp=$7; cch=$8; out=$9; secs=$11 }
+      else if (NF >= 10){ side=$3; model=$4; label=$5; tot=$6+0; inp=$7; cch=$8; out=$9 }
+      else              { side=$3; model="-"; label=$4; tot=$5+0; inp=$6; cch="";  out=$7 }
       n++; s_side[n]=side; s_model[n]=model; s_label[n]=label;
-      s_tot[n]=tot; s_in[n]=inp; s_cch[n]=cch; s_out[n]=out;
+      s_tot[n]=tot; s_in[n]=inp; s_cch[n]=cch; s_out[n]=out; s_sec[n]=secs;
       sum[side]+=tot; grand+=tot;
+      if (secs != "") { tsum[side]+=secs; tgrand+=secs }
       if (model != "-" && model != "") msum[model]+=tot;
     }
     END {
-      printf "  %-7s %-14s %-24s %12s  %s\n", "side", "model", "step", "tokens", "(in/cached/out)";
+      printf "  %-7s %-14s %-24s %12s %8s  %s\n", "side", "model", "step", "tokens", "time", "(in/cached/out)";
       for (i=1;i<=n;i++) {
         io = "";
         if (s_in[i]!="" || s_out[i]!="")
           io = sprintf("(%s/%s/%s)", s_in[i], (s_cch[i]==""?"?":s_cch[i]), s_out[i]);
-        printf "  %-7s %-14s %-24s %12d  %s\n", s_side[i], s_model[i], s_label[i], s_tot[i], io;
+        t = (s_sec[i]=="") ? "-" : sprintf("%dm%02ds", s_sec[i]/60, s_sec[i]%60);
+        printf "  %-7s %-14s %-24s %12d %8s  %s\n", s_side[i], s_model[i], s_label[i], s_tot[i], t, io;
       }
-      printf "  %s\n", "----------------------------------------------------------------------";
+      printf "  %s\n", "------------------------------------------------------------------------------";
       for (m in msum) printf "  %-22s %12d\n", m " total:", msum[m];
-      printf "  Codex total:  %12d\n", sum["codex"]+0;
-      printf "  Claude total: %12d  %s\n", sum["claude"]+0,
+      printf "  Codex total:  %12d%s\n", sum["codex"]+0,
+             (tsum["codex"]>0 ? sprintf("   (%dm%02ds)", tsum["codex"]/60, tsum["codex"]%60) : "");
+      printf "  Claude total: %12d%s  %s\n", sum["claude"]+0,
+             (tsum["claude"]>0 ? sprintf("   (%dm%02ds)", tsum["claude"]/60, tsum["claude"]%60) : ""),
              (sum["claude"]+0==0 ? "(none recorded — run claude_usage.sh end <task> for the interactive session)" : "");
-      printf "  Grand total:  %12d\n", grand+0;
+      printf "  Grand total:  %12d%s\n", grand+0,
+             (tgrand>0 ? sprintf("   (%dm%02ds)", tgrand/60, tgrand%60) : "");
     }
   ' "$ledger"
 }

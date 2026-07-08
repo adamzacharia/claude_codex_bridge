@@ -128,6 +128,7 @@ run_codex_bg() {
   wait "$pid"
 }
 
+T0=$(date +%s 2>/dev/null || echo 0)
 if [ "$RESUME" -eq 1 ]; then
   # Resume the EXACT session id captured from the last fresh run. We deliberately
   # do NOT fall back to `codex exec resume --last`: --last is cwd-filtered and can
@@ -145,6 +146,7 @@ else
   run_codex_bg exec "${BASE[@]}" -s "$SANDBOX" "$@"
 fi
 RC=$?
+DUR=$(( $(date +%s 2>/dev/null || echo 0) - T0 ))
 
 # Capture this run's session id so a later `--resume` can target it explicitly:
 # JSONL thread.started first, legacy "session id:" header as fallback.
@@ -187,7 +189,7 @@ if command -v usage_record_codex >/dev/null 2>&1; then
   usage_record_codex \
     "${CODEX_USAGE_LEDGER:-$DIR/usage.tsv}" \
     "${CODEX_USAGE_LABEL:-$DEFAULT_LABEL}" \
-    "$JSONL" "$LOG" "$RC" "$MODEL" 2>/dev/null || true
+    "$JSONL" "$LOG" "$RC" "$MODEL" "$DUR" 2>/dev/null || true
 fi
 
 echo "codex_bridge: exit=$RC mode=$MODE sandbox=$SANDBOX resume=$RESUME model=$MODEL effort=$EFFORT fast=${CODEX_FAST:+on} json=$([ "$JSON_OK" -eq 1 ] && echo on || echo off)"

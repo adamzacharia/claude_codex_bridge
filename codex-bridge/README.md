@@ -8,13 +8,18 @@ copy-paste**. Fully portable — no project-specific paths.
 ## What you get
 
 - **Three collaboration modes**, triggered by a keyword you append to a request:
-  - `@cx-build` — Codex implements; failing tests are fed back for bounded fix
-    rounds; Claude cross-reviews the diff and Codex must fix-or-rebut each finding.
-  - `@cx-guard` — Claude implements; Codex reviews over threaded rounds into a
-    CX-NN findings ledger, then **verifies** Claude's fixes (`VERDICT: CLEAN|REOPEN`).
-  - `@cx-duel` — mutual-critique debate: both answer the same task independently
-    (round 0 is blind), critique each other every round, and a fresh-context
-    arbiter rules on whatever doesn't converge.
+  - `@cx-build` — Codex implements behind a Claude **plan gate** (and optional
+    Claude-authored acceptance tests); failing tests feed back with stall
+    detection + cross-model diagnosis; spec-aware self-review and Claude
+    cross-review run in parallel; Codex must fix-or-rebut every finding and the
+    reviewer then **verifies** the fixes (`VERDICT: CLEAN|REOPEN`).
+  - `@cx-guard` — Claude implements; tests run before review as ground truth;
+    Codex reviews into a linted CX-NN findings ledger, then **verifies** every
+    fix/waiver against the actual red/green transition.
+  - `@cx-duel` — mutual-critique debate with a machine-checked disagreement
+    ledger and mechanically verified citations: parallel blind round 0, a
+    mandatory red-team attack before convergence stands, and an anonymized
+    two-model arbiter panel for whatever remains.
 - **Share-everything discussion** — every artifact (test logs, diffs, reviews,
   decisions) is fed verbatim into the other model's next prompt; each side must
   answer the other's numbered questions. See PROTOCOL.md → "Information sharing".
@@ -28,38 +33,56 @@ copy-paste**. Fully portable — no project-specific paths.
 - **Full token accounting** — Codex per call, headless Claude per call, and the
   interactive Claude Code session via `claude_usage.sh end <task>`.
 
-## 60-second install
+## Install: exactly what to copy, exactly what to edit
 
-1. Copy this whole `codex-bridge/` folder into the root of your repo — or run
-   [`install.sh`](../install.sh) from inside your repo.
-2. Validate the toolchain (free, no model calls):
+### 1. COPY — one folder, nothing else
 
-   ```bash
-   bash codex-bridge/doctor.sh
-   ```
+| Copy into your repo? | What | Why |
+|---|---|---|
+| ✅ **YES — the whole `codex-bridge/` folder** | every `.sh` script, every `.md` doc, `VERSION`, `.gitignore.example` | the kit is self-contained; the scripts find each other automatically |
+| ❌ no | `tmp/`, `tmp/codex/` | runtime artifacts (task logs, memory, ledgers) — never copy these between repos |
+| ❌ no | `tests/`, `.github/` (from the kit's home repo) | kit development only |
+| optional | `install.sh` (from the kit's home repo) | does the copy + gitignore wiring for you: run it from inside your repo |
 
-3. Add these lines to your repo's `CLAUDE.md` (create it if missing) so Claude
-   loads the protocol every session — a ready-to-paste version is in
-   [`CLAUDE.md.example`](CLAUDE.md.example):
+Put the folder at your **repo root** (`your-repo/codex-bridge/`). Don't rename
+files inside it.
 
-   > Claude ↔ Codex collaboration is enabled via `codex-bridge/`. Read
-   > `codex-bridge/PROTOCOL.md` and follow it for all non-trivial work.
+### 2. EDIT — two files in your repo, one on your machine
 
-4. Git-ignore the runtime dirs (see [`.gitignore.example`](.gitignore.example)) —
-   **commit the kit itself** so your whole team gets it:
+| File | What to do | Template |
+|---|---|---|
+| `your-repo/CLAUDE.md` | Paste the whole section from the template (create `CLAUDE.md` at the repo root if missing; delete the template's `#`-comment header). This is what makes Claude load the protocol every session — without it the kit is never triggered. **Adapt one thing**: if your default branch is not `main`, add a line telling Claude to always pass `--base <your-branch>`. | [`CLAUDE.md.example`](CLAUDE.md.example) |
+| `your-repo/.gitignore` | Append the two runtime lines. **Recommended:** commit the `codex-bridge/` folder itself so teammates get it via `git pull`; if you prefer it untracked, also add a `codex-bridge/` line. | [`.gitignore.example`](.gitignore.example) |
+| `~/.codex/config.toml` (machine-level, once) | Model/effort defaults + the **Windows sandbox fix** (`[windows] sandbox = "unelevated"`). | [`SETUP.md`](SETUP.md) §4 |
 
-   ```
-   tmp/codex/
-   codex-bridge/tmp/
-   ```
+Do **not** edit `PROTOCOL.md`, `SETUP.md`, or the scripts per-repo — they are
+generic on purpose, so updating the kit later stays a plain folder overwrite.
 
-   (Prefer the kit untracked? Add `codex-bridge/` too — just know teammates then
-   have to install it themselves.)
+### 3. VERIFY (free, no model calls)
 
-5. Read [`SETUP.md`](SETUP.md) for prerequisites (Codex CLI, `~/.codex/config.toml`,
-   the Windows sandbox fix) and a smoke test.
+```bash
+bash codex-bridge/doctor.sh        # validates codex login, config, python, everything
+bash codex-bridge/codex_loop.sh --help
+```
 
 Then just try it: *"Add input validation to the config loader. @cx-build"*
+
+## Updating an OLD copy of the kit in a repo
+
+1. **Overwrite every kit file**: delete the old `.sh`/`.md`/`VERSION` files inside
+   that repo's `codex-bridge/` and copy the new ones in. Keep any local-only
+   files YOU added there (they are not part of the kit).
+2. **Re-paste the `CLAUDE.md` section** from the NEW
+   [`CLAUDE.md.example`](CLAUDE.md.example) — the mode semantics change between
+   versions (plan gate, DX ledger, verify steps…), and a stale section makes
+   Claude drive the new scripts with old assumptions. Re-apply your one
+   adaptation (`--base <branch>`).
+3. **Re-check `.gitignore`** has `tmp/codex/` and `codex-bridge/tmp/`.
+4. Run `bash codex-bridge/doctor.sh`. The installed version shows in `--help`
+   and every SUMMARY line (`codex-bridge vX.Y.Z`).
+
+Runtime state (`tmp/codex/` memory + task history) is untouched by updates —
+the new kit keeps reading the same memory file.
 
 ## Files
 

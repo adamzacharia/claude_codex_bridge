@@ -38,6 +38,11 @@ KIT_VERSION="$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo '?')"
 
 GUARD_LINE='Do NOT read or print generated files (.next/, dist/, build/, node_modules/, coverage/, *.min.*, compiled CSS). Reason about source only; never cat build output.'
 SHARE_LINE='Share EVERYTHING relevant with your counterpart: every file you changed and why, every command you ran and its outcome, test results verbatim (tail if long), every assumption you made, and anything you are unsure about. End with two sections: "NOTES FOR CLAUDE" (facts/decisions the other side must know) and "OPEN QUESTIONS" (numbered; write "none" if empty).'
+# Duel discussion discipline (research-backed): stable per-point ledger so
+# disagreements cannot silently vanish, and machine-checkable evidence so
+# agreement is grounded in verifiable facts rather than politeness.
+DX_GRAMMAR='Maintain a DISAGREEMENT LEDGER: one line per point of contention, exactly: "- DX-01 | OPEN|AGREED|CONCEDED-CLAUDE|CONCEDED-CODEX | <one-line statement> | evidence: <path:line or URL>". Keep ids STABLE across rounds; NEVER silently drop a point — move it to AGREED or CONCEDED-* instead. End the ledger with the line "TOTAL OPEN: <n>". Agreement is only valid when accompanied by NEW evidence (a test result, a code trace, a citation) — do not agree just to converge.'
+EVIDENCE_LINE='Cite checkable evidence for every substantive claim as: EVIDENCE: <path>:<line> "<verbatim quote up to 120 chars>" (URLs may be cited as EVIDENCE: <url>). Citations are mechanically verified; failed ones are flagged to your counterpart as unproven.'
 
 MODE="build"
 BASE="main"
@@ -51,10 +56,16 @@ DRY_RUN=0
 FIX_ROUNDS=2
 CLAUDE_REVIEW=0
 ARBITER=1
+PLAN_GATE=1           # build: Claude rules on Codex's consult questions before build
+AUTHOR_TESTS=0        # build: Claude authors acceptance tests before Codex codes
+QUICK=0               # build: merge consult+build into one fresh Codex turn
+FORCE_FINALIZE=0      # duel me-driven: skip the red-team gate at finalize
+CROSS_SID=""          # build: cross-reviewer session id (post-response verify threads it)
 
 # duel-debate state (mode=duel only; harmless defaults for build/guard)
 AUTO=0
-ROUNDS=4
+ROUNDS=3              # research: debate gains plateau by round 2-3
+REDTEAM_DONE=0        # one falsification exchange before convergence is honored
 CODE=0
 SEED_FILE=""
 PROMPT_FILE=""
@@ -88,16 +99,22 @@ usage: bash codex-bridge/codex_loop.sh --mode <build|guard|duel> [--task <id>]
        [--base <branch>] [--test '<cmd>'] [--spec <file>]
        [--model <m>] [--effort <low|medium|high|xhigh>] [--fast]
        [--dry-run] [--teardown]
-       build: [--fix-rounds N] [--claude-review]
+       build: [--fix-rounds N] [--claude-review] [--no-plan-gate] [--author-tests]
+              [--quick]
        guard: [--spec <file>] [--step verify]
        duel:  [--auto] [--rounds N] [--code] [--seed <file>] [--prompt <file>]
               [--step init|codex|finalize] [--claude-model <m>] [--budget-usd <amt>]
-              [--max-bytes N] [--no-arbiter]
+              [--max-bytes N] [--no-arbiter] [--force-finalize]
 
 Modes:
-  build   Codex implements, tests are fed back for bounded fix rounds
-          (--fix-rounds, default 2), Codex self-reviews, and --claude-review
-          adds a headless-Claude cross-review + a Codex fix-or-rebut round.
+  build   Codex critiques the spec (a headless-Claude PLAN GATE rules on its
+          questions unless --no-plan-gate; --author-tests has Claude write
+          acceptance tests first; --quick merges consult+build into one call),
+          implements, tests feed back for bounded fix rounds (--fix-rounds,
+          default 2, with stall detection + cross-model diagnosis), then a
+          spec-aware Codex self-review and --claude-review cross-review run in
+          parallel; findings force a fix-or-rebut round, whose FIXED claims the
+          cross-reviewer then verifies (VERDICT: CLEAN|REOPEN).
   guard   Claude already edited; Codex reviews hard over threaded rounds and
           emits a CX-NN findings ledger. After you write reconciliation.md,
           '--task <id> --step verify' makes Codex re-check every fix/waiver
@@ -143,6 +160,10 @@ while [ $# -gt 0 ]; do
     --fast)          CODEX_FAST=1; FAST_SET=1; shift ;;
     --fix-rounds)    require_value "$@"; FIX_ROUNDS="$2"; shift 2 ;;
     --claude-review) CLAUDE_REVIEW=1; shift ;;
+    --no-plan-gate)  PLAN_GATE=0; shift ;;
+    --author-tests)  AUTHOR_TESTS=1; shift ;;
+    --quick)         QUICK=1; shift ;;
+    --force-finalize) FORCE_FINALIZE=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
     --teardown)      TEARDOWN=1; shift ;;
     --auto)          AUTO=1; shift ;;
@@ -275,6 +296,7 @@ save_duel_env() {
     printf 'CLAUDE_MODEL=%q\n' "$CLAUDE_MODEL"
     printf 'BUDGET_USD=%q\n'   "$BUDGET_USD"
     printf 'CONV_TOKEN=%q\n'   "$CONV_TOKEN"
+    printf 'REDTEAM_DONE=%q\n' "$REDTEAM_DONE"
   } > "$DUEL_ENV" 2>/dev/null || true
 }
 
@@ -292,6 +314,7 @@ load_duel_env() {
   [ "$CLMODEL_SET" -eq 0 ] && CLAUDE_MODEL="${P_CLAUDE_MODEL:-}"
   [ "$BUDGET_SET" -eq 0 ] && BUDGET_USD="${P_BUDGET_USD:-}"
   CONV_TOKEN="${P_CONV_TOKEN:-$CONV_TOKEN}"
+  REDTEAM_DONE="${P_REDTEAM_DONE:-0}"
   # A CLI override on a later step becomes the new persisted truth.
   save_duel_env
   return 0
@@ -389,6 +412,54 @@ memory_append_run() {
   } >> "$MEMORY_FILE" 2>/dev/null || true
 }
 
+# Normalized failure signature: digits stripped so timings/counters do not
+# defeat the comparison. Identical signature = the last fix did not move the
+# failing path at all.
+test_sig() {
+  tail -c 4000 "$1" 2>/dev/null | sed -E 's/[0-9]+//g' | md5sum 2>/dev/null | awk '{print $1}'
+}
+
+# Shallow error classes repair at far higher rates than logic/assertion
+# failures (research) — worth one cheap high-effort attempt before xhigh rounds.
+test_is_shallow() {
+  grep -aqE 'SyntaxError|ImportError|ModuleNotFoundError|NameError|ReferenceError|cannot find module|Unexpected token|compilation failed|ParseError|IndentationError' "$1" 2>/dev/null
+}
+
+# Bounded context bundle for the consult: repo map, conventions, and the
+# current content of files the spec names — raises first-attempt correctness
+# per token far better than letting Codex explore serially. Consult-only: the
+# threaded build call inherits it through the session.
+context_pack() {
+  [ -n "${CODEX_NO_CONTEXT_PACK:-}" ] && return 0
+  printf '=== REPO MAP (tracked files, capped at 200) ===\n'
+  git ls-files 2>/dev/null | grep -avE '(^|/)(node_modules|dist|build|coverage|\.next)(/|$)' | head -200
+  printf '\n'
+  local f
+  for f in CLAUDE.md CONTRIBUTING.md; do
+    if [ -f "$REPO_ROOT/$f" ]; then
+      printf '=== CONVENTIONS: %s (truncated) ===\n' "$f"
+      head -c 4000 "$REPO_ROOT/$f" 2>/dev/null
+      printf '\n\n'
+    fi
+  done
+  local tok hits=0 miss=""
+  printf '=== SPEC-REFERENCED FILES (current content) ===\n'
+  for tok in $(printf '%s' "$SPEC_CONTENT" | grep -oE '[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9]{0,3}' | sort -u | head -20); do
+    if git ls-files --error-unmatch "$tok" >/dev/null 2>&1; then
+      hits=$((hits + 1))
+      [ "$hits" -gt 8 ] && { printf '(more spec-referenced files exist — read them yourself)\n'; break; }
+      printf -- '--- %s ---\n' "$tok"
+      head -c 8000 "$REPO_ROOT/$tok" 2>/dev/null
+      printf '\n'
+    else
+      case "$tok" in */*) miss="$miss $tok" ;; esac
+    fi
+  done
+  [ "$hits" -eq 0 ] && printf '(none matched)\n'
+  [ -n "$miss" ] && printf 'WARNING: the spec mentions paths that do NOT exist in the repo:%s — flag this in your critique.\n' "$miss"
+  printf '\n'
+}
+
 # --- Spec / prompt builders --------------------------------------------------
 read_spec() {
   if [ -n "$SPEC_FILE" ]; then
@@ -404,19 +475,70 @@ read_spec() {
 
 prompt_consult() {
   printf 'You are planning a change TOGETHER with Claude (who drafted the spec below). Critique it before any edits: identify risks, edge cases, missing tests, and better alternatives — and propose concrete improvements, do not just approve. Do not modify files.\n\n'
-  printf 'End with two sections: "PROPOSED SPEC CHANGES" (what you would amend and why) and "OPEN QUESTIONS FOR CLAUDE" (numbered; write "none" if empty).\n\n'
+  printf 'End with two sections: "PROPOSED SPEC CHANGES" (what you would amend and why) and "OPEN QUESTIONS FOR CLAUDE" (numbered; write "none" if empty). Claude WILL answer them before you implement.\n\n'
   printf '%s\n' "$GUARD_LINE"
   printf 'Do not run install commands, dev servers, or full builds.\n\n'
   memory_section
+  context_pack
   printf 'SPEC:\n%s\n' "$SPEC_CONTENT"
 }
 
 prompt_build() {
-  printf 'Implement the spec AND address your own critique above. Where you raised OPEN QUESTIONS, adopt the most reasonable answer and STATE which you chose. Edit only source files.\n\n'
+  printf 'Implement the spec AND address your own critique above. Edit only source files.\n\n'
+  if [ -s "$TASK_DIR/answers.md" ]; then
+    printf '=== CLAUDE ANSWERS & SPEC RULINGS (follow these; only where a ruling is CANNOT RULE, adopt the most reasonable answer and STATE which you chose) ===\n'
+    truncate_bytes "$TASK_DIR/answers.md" "$MAX_BYTES"
+    printf '\n\n'
+  else
+    printf 'Where you raised OPEN QUESTIONS, adopt the most reasonable answer and STATE which you chose.\n\n'
+  fi
+  if [ -s "$TASK_DIR/acceptance_tests.md" ]; then
+    printf '=== ACCEPTANCE TESTS (authored independently by Claude from the spec) ===\nAdd these to the test suite and MAKE THEM PASS. Do NOT weaken, skip, or rewrite them to fit your implementation — if one is genuinely wrong, say so explicitly with a reason instead of changing it.\n'
+    truncate_bytes "$TASK_DIR/acceptance_tests.md" "$MAX_BYTES"
+    printf '\n\n'
+  fi
   printf '%s\n\n' "$SHARE_LINE"
   printf '%s\n' "$GUARD_LINE"
   printf 'Do not run install commands, dev servers, or full builds.\n\n'
   printf 'SPEC:\n%s\n' "$SPEC_CONTENT"
+}
+
+# --quick: one fresh Codex turn does critique + implementation (saves a full
+# serial xhigh call for small/mechanical specs; the split path with the plan
+# gate remains the default for anything non-trivial).
+prompt_consult_build() {
+  printf 'Work in two phases in ONE reply, with these exact headers:\n=== PHASE 1: CRITIQUE ===\nCritique the spec before touching anything: risks, edge cases, missing tests, better alternatives; end the phase with "PROPOSED SPEC CHANGES" and "OPEN QUESTIONS" — answer each question yourself and STATE the answer you adopt.\n=== PHASE 2: IMPLEMENTATION NOTES ===\nImplement per your amended spec. Edit only source files.\n\n'
+  if [ -s "$TASK_DIR/acceptance_tests.md" ]; then
+    printf '=== ACCEPTANCE TESTS (authored independently by Claude) ===\nAdd these to the test suite and MAKE THEM PASS; do not weaken or rewrite them.\n'
+    truncate_bytes "$TASK_DIR/acceptance_tests.md" "$MAX_BYTES"
+    printf '\n\n'
+  fi
+  printf '%s\n\n' "$SHARE_LINE"
+  printf '%s\n' "$GUARD_LINE"
+  printf 'Do not run install commands, dev servers, or full builds.\n\n'
+  memory_section
+  context_pack
+  printf 'SPEC:\n%s\n' "$SPEC_CONTENT"
+}
+
+# Plan gate: headless Claude rules on the consult BEFORE Codex implements —
+# the cheapest point in the whole pipeline to kill a wrong approach.
+prompt_plan_answers() {
+  printf 'You are CLAUDE, the spec author. CODEX critiqued your spec below and asked questions. Rule decisively:\n(1) answer EVERY numbered open question — a concrete decision, or the literal words CANNOT RULE if the spec truly cannot decide it;\n(2) for each PROPOSED SPEC CHANGE: ACCEPT or REJECT with one-line reason;\n(3) if Codex offered alternative approaches, pick exactly ONE and say why;\n(4) if the spec implies tests but no test command was configured, add the line: WARNING: no --test command wired.\nBe terse; your output is injected verbatim into the implementation prompt.\n\n'
+  memory_section
+  printf '=== SPEC ===\n%s\n\n' "$SPEC_CONTENT"
+  printf '=== CODEX CRITIQUE ===\n'
+  truncate_bytes "$TASK_DIR/consult.md" "$MAX_BYTES"
+  printf '\n'
+}
+
+# Cross-model test authorship: tests written by the model that will NOT write
+# the code do not share the implementation's blind spots (research: test-first
+# flows roughly double solve rates; same-model tests inherit the same bugs).
+prompt_author_tests() {
+  printf 'You are CLAUDE. Write ACCEPTANCE TESTS for the spec below BEFORE any implementation exists (Codex, a different model, will implement and must make these pass unchanged). Derive them from the spec and the current code conventions — read the repo with your tools. Include: happy path, each edge case the spec implies, and at least one failure-mode case. Output runnable test code in the project'\''s existing test framework (say which file to add it to), not prose descriptions.\n\n'
+  memory_section
+  printf '=== SPEC ===\n%s\n' "$SPEC_CONTENT"
 }
 
 prompt_fix() {
@@ -428,11 +550,67 @@ prompt_fix() {
   tail -c "$MAX_BYTES" "$TASK_DIR/test.log" 2>/dev/null || printf '(no test log)\n'
 }
 
+# Escalated fix prompt: the failure signature did not change, so mechanical
+# retrying is burning xhigh rounds — force diagnosis before edits and inject an
+# INDEPENDENT cross-model diagnosis (research: feedback quality, not repair
+# ability, bottlenecks self-repair).
+prompt_fix_escalated() {
+  printf 'STOP: the failure output is UNCHANGED since your last fix — your previous edit did not affect the failing path. Before touching any file, state 2-3 RANKED root-cause hypotheses with file:line evidence, pick one, and only then edit. Do not weaken or delete tests.\n\n'
+  if [ -s "$TASK_DIR/fix_diagnosis.md" ]; then
+    printf '=== CROSS-MODEL DIAGNOSIS (independent, from Claude — weigh it, it has not seen your reasoning) ===\n'
+    truncate_bytes "$TASK_DIR/fix_diagnosis.md" "$MAX_BYTES"
+    printf '\n\n'
+  fi
+  printf '=== CURRENT DIFF vs %s ===\n' "$BASE"
+  git diff "$BASE" -- 2>/dev/null | head -c "$MAX_BYTES"
+  printf '\n\n%s\n\n' "$SHARE_LINE"
+  printf '%s\nDo not run install commands, dev servers, or full builds.\n\n' "$GUARD_LINE"
+  printf 'COMMAND: %s\n\n=== TEST OUTPUT (tail) ===\n' "$TEST_CMD"
+  tail -c "$MAX_BYTES" "$TASK_DIR/test.log" 2>/dev/null || printf '(no test log)\n'
+}
+
+prompt_fix_diagnosis() {
+  printf 'You are CLAUDE. Codex implemented a change and its fix attempts are STALLED: the test failure below is unchanged across attempts. Diagnose independently — read the changed files with your tools. Output: 2-3 ranked root-cause hypotheses with file:line evidence, and for each, the minimal fix you would try. Do NOT edit anything.\n\n'
+  printf '=== FAILING COMMAND ===\n%s\n\n=== TEST OUTPUT (tail) ===\n' "$TEST_CMD"
+  tail -c 8000 "$TASK_DIR/test.log" 2>/dev/null
+  printf '\n\n=== DIFF vs %s (may be truncated) ===\n' "$BASE"
+  git diff "$BASE" -- 2>/dev/null | head -c "$MAX_BYTES"
+  printf '\n'
+}
+
+# Post-response verify: the cross-reviewer resumes ITS OWN session (it holds
+# its findings in-context and cannot be talked out of them by Codex's summary)
+# and refutes each FIXED claim against the current diff.
+prompt_build_verify() {
+  printf 'Codex responded to your review below, claiming fixes and rebuttals. Your stance is REFUTER: for each "FIXED" claim, try to show the fix is cosmetic, incomplete, or introduced a regression — CONFIRM only with file:line evidence from the CURRENT diff; for each "REBUTTED", say AGREE or CONTEST in one line. Do not rubber-stamp.\n'
+  printf 'End with the single line:  VERDICT: CLEAN\nor:                         VERDICT: REOPEN CX-.. SX-..   (every finding not settled)\n\n'
+  printf '=== CODEX RESPONSE ===\n'
+  truncate_bytes "$TASK_DIR/codex_response.md" "$MAX_BYTES"
+  printf '\n=== CURRENT DIFF vs %s (may be truncated — Read files for full context) ===\n' "$BASE"
+  git diff "$BASE" -- 2>/dev/null | head -c "$MAX_BYTES"
+  printf '\n'
+}
+
+prompt_codex_reopen() {
+  printf 'The cross-reviewer verified your fixes and REOPENED the findings below — your fix was judged cosmetic, incomplete, or regressive. Address ONLY these, for real this time; if you still believe one is wrong, give a NEW argument (the old one was already rejected).\n\n'
+  printf 'REOPENED: %s\n\n' "$(cat "$TASK_DIR/reopened.txt" 2>/dev/null | tr '\n' ' ')"
+  printf '=== REVIEWER VERDICT ===\n'
+  truncate_bytes "$TASK_DIR/build_verify.md" "$MAX_BYTES"
+  printf '\n\n%s\n\n' "$SHARE_LINE"
+  printf '%s\nDo not run install commands, dev servers, or full builds.\n' "$GUARD_LINE"
+}
+
 prompt_guard_review() {
-  printf 'Review the UNCOMMITTED changes in this repo. Run `git status` to list them, `git diff %s` to see MODIFIED files, and read any NEW/untracked files in full (plain `git diff` does not show untracked content). Report correctness bugs, missing tests, and risky edge cases with concrete file:line references. Also ask numbered "QUESTIONS FOR CLAUDE" about anything whose intent is unclear. Do not modify files.\n\n' "$BASE"
+  printf 'Review the UNCOMMITTED changes in this repo. Run `git status` to list them, `git diff %s` to see MODIFIED files, and read any NEW/untracked files in full (plain `git diff` does not show untracked content). Report correctness bugs, missing tests, and risky edge cases with concrete file:line references. Confirm what is CORRECT where it is correct — report a problem only with concrete evidence, not to seem thorough. Also ask numbered "QUESTIONS FOR CLAUDE" about anything whose intent is unclear. Do not modify files.\n\n' "$BASE"
   if [ -n "$SPEC_CONTENT" ]; then
     printf '=== INTENT (what this change is SUPPOSED to do — judge the diff against it) ===\n%s\n\n' "$SPEC_CONTENT"
     printf 'Flag both: requirements NOT implemented, and implemented behavior that was NOT required.\n\n'
+  fi
+  if [ "$TEST_CMD_SET" -eq 1 ] && [ -f "$TASK_DIR/test_review.log" ]; then
+    printf '=== TEST RESULT (execution ground truth) ===\ncommand: %s\nresult: %s\n' "$TEST_CMD" "${TEST_RESULT_REVIEW:-$TEST_RESULT}"
+    printf 'output tail:\n'
+    tail -c 4000 "$TASK_DIR/test_review.log" 2>/dev/null
+    printf '\nA failing test is your strongest lead — trace it to root cause before anything else.\n\n'
   fi
   memory_section
   printf '=== CHANGE INVENTORY (computed by the bridge) ===\n'
@@ -448,15 +626,29 @@ prompt_guard_findings() {
 }
 
 prompt_guard_verify() {
-  printf 'Claude has reconciled your findings. Below are your findings ledger and Claude'\''s reconciliation. For EACH finding: if marked FIXED, verify the fix in the CURRENT uncommitted diff yourself (re-run `git status` / `git diff %s`, read the files) and cite file:line evidence; if marked WAIVED, reply AGREE or CONTEST with one concrete reason. Also flag any NEW regression the fixes introduced. Be adversarial — do not rubber-stamp.\n\n' "$BASE"
+  printf 'Claude has reconciled your findings. Below are your ledger lines and Claude'\''s reconciliation. For EACH finding: if marked FIXED, verify the fix in the CURRENT uncommitted diff yourself (re-run `git status` / `git diff %s`, read the files) and cite file:line evidence; if marked WAIVED, reply AGREE or CONTEST with one concrete reason. Also flag any NEW regression the fixes introduced. Be adversarial — do not rubber-stamp.\n\n' "$BASE"
   printf 'End with the single line:  VERDICT: CLEAN\nor:                         VERDICT: REOPEN CX-.. CX-..   (every finding that is not settled)\n\n'
   printf '%s\n\n' "$GUARD_LINE"
-  printf '=== YOUR FINDINGS ===\n'
-  truncate_bytes "$TASK_DIR/findings.md" "$MAX_BYTES"
+  # Prompt diet: this call RESUMES the review thread, which already contains the
+  # full findings prose — re-feed only the ledger lines (they carry severity +
+  # file:line) and point at the tree as ground truth. BRIDGE_FAT_PROMPTS=1
+  # restores the verbatim re-feed for compacted-thread edge cases.
+  printf '=== YOUR FINDINGS (ledger lines; full detail is earlier in this thread — the current tree is the ground truth, re-read the files) ===\n'
+  if [ -n "${BRIDGE_FAT_PROMPTS:-}" ]; then
+    truncate_bytes "$TASK_DIR/findings.md" "$MAX_BYTES"
+  else
+    tr -d '\r' < "$TASK_DIR/findings.md" 2>/dev/null | grep -aE '^[[:space:]]*-[[:space:]]*\[.\][[:space:]]*(\*\*|`)?CX-[0-9]+' || printf '(no ledger lines parsed — see findings.md)\n'
+  fi
   printf '\n=== CLAUDE RECONCILIATION ===\n'
   truncate_bytes "$TASK_DIR/reconciliation.md" "$MAX_BYTES"
   printf '\n'
-  journal_section
+  if [ "$TEST_CMD_SET" -eq 1 ]; then
+    printf '=== TEST RESULT AT REVIEW TIME ===\ncommand: %s\nresult: %s\n' "$TEST_CMD" "${TEST_RESULT_REVIEW:-unknown}"
+    [ -f "$TASK_DIR/test_review.log" ] && { printf 'tail:\n'; tail -c 3000 "$TASK_DIR/test_review.log" 2>/dev/null; }
+    printf '\n=== TEST RESULT NOW (after Claude'\''s fixes) ===\nresult: %s\n' "$TEST_RESULT"
+    [ -f "$TASK_DIR/test_verify.log" ] && { printf 'tail:\n'; tail -c 3000 "$TASK_DIR/test_verify.log" 2>/dev/null; }
+    printf '\nJudge regressions against this actual transition, not by re-derivation.\n\n'
+  fi
 }
 
 build_claude_review_prompt() {
@@ -479,12 +671,29 @@ build_claude_review_prompt() {
 }
 
 prompt_codex_response() {
-  printf 'Claude cross-reviewed your work; its findings are below. For EACH finding: FIX it (edit the files) if valid, or REBUT it with a concrete reason if not. Do not silently skip any. Then summarize per finding on one line each: CX-NN -> FIXED (what you changed) | REBUTTED (why).\n\n'
+  printf 'Your work was reviewed on two independent tracks: Claude cross-reviewed the diff (CX findings) and your own spec-aware self-review flagged issues (SX findings). For EACH finding on BOTH lists: FIX it (edit the files) if valid, or REBUT it with a concrete reason if not. Do not silently skip any. Then summarize per finding on one line each: CX-NN -> FIXED (what you changed) | REBUTTED (why)  (same for SX-NN).\n\n'
   printf '%s\n\n' "$SHARE_LINE"
   printf '%s\n' "$GUARD_LINE"
   printf 'Do not run install commands, dev servers, or full builds.\n\n'
-  printf '=== CLAUDE REVIEW ===\n'
+  printf '=== CLAUDE REVIEW (CX) ===\n'
   truncate_bytes "$TASK_DIR/claude_review.md" "$MAX_BYTES"
+  if [ -s "$TASK_DIR/self_findings.md" ]; then
+    printf '\n=== YOUR OWN SELF-REVIEW FINDINGS (SX — fix-or-rebut these too) ===\n'
+    truncate_bytes "$TASK_DIR/self_findings.md" "$MAX_BYTES"
+  fi
+  printf '\n'
+}
+
+# One-shot grammar nudges (never die after a paid call; ask once, then proceed
+# with a warning).
+prompt_findings_nudge() {
+  printf 'Your findings ledger has GRAMMAR/REFERENCE violations (listed below). Re-emit the ENTIRE ledger, content unchanged except for the corrections, in EXACTLY the grammar:\n- [ ] CX-01 | BLOCKER|MAJOR|MINOR | <file>:<line> | <one-line summary>\nending with "TOTAL: <n>". Drop a finding only if its file:line reference was wrong AND you cannot support it with a correct one.\n\n=== VIOLATIONS ===\n'
+  cat "$TASK_DIR/lint.txt" 2>/dev/null
+  printf '\n'
+}
+
+prompt_verdict_nudge() {
+  printf 'Your verify reply did not end with a machine-readable verdict. Based ONLY on what you already concluded, output exactly ONE line and nothing else:\nVERDICT: CLEAN\nor\nVERDICT: REOPEN CX-.. CX-..\n'
 }
 
 copy_last_message() {
@@ -520,38 +729,66 @@ run_bridge() {
   CODEX_USAGE_LABEL="$_label" CODEX_BRIDGE_DIR="$BRIDGE_DIR" bash "$BRIDGE" "$bridge_mode" "$@" < "$pfile" > "$log" 2>&1
   rc=$?
   copy_last_message "$dest"
-  journal "codex $_label rc=$rc -> $(basename "$dest")"
+  journal "codex $_label rc=$rc prompt=$(wc -c < "$pfile" 2>/dev/null || echo '?')B -> $(basename "$dest")"
   return "$rc"
 }
 
+# Spec-aware structured self-review. `codex exec review` accepts custom
+# instructions via the `-` positional + stdin (verified on codex-cli 0.142.4),
+# so the reviewer finally sees the INTENT and must emit the CX-NN ledger
+# grammar — its findings can then join the fix-or-rebut round instead of dying
+# as advisory prose. Falls back to the plain canned review on clap errors from
+# older CLIs. --uncommitted covers staged+unstaged+UNTRACKED changes.
 run_review() {
   out="$1"
   log="$2"
 
   : > "$out"
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "DRY-RUN: would run: codex exec review --uncommitted -m $CODEX_MODEL (effort=$CODEX_EFFORT)"
+    echo "DRY-RUN: would run: codex exec review --uncommitted - < review_instructions (model=$CODEX_MODEL effort=$CODEX_EFFORT)"
     printf '(dry run)\n' > "$out"
     return 0
   fi
-  # `codex exec review` REJECTS a custom PROMPT arg together with --uncommitted
-  # /--base (clap conflict -> exit 2), so pass NO prompt. --uncommitted scopes the
-  # review to staged+unstaged+UNTRACKED changes, so brand-new files Codex created
-  # are covered (--base diffs vs a commit and misses untracked files entirely).
-  review_fast=()
+  local instr="$PROMPTS_DIR/review_instructions.prompt.md"
+  {
+    printf 'Review the uncommitted changes against the INTENT below. Confirm the code is correct where it IS correct; report a finding ONLY with concrete file:line evidence and a plausible failure scenario. Cap at 10 findings — rank by severity, no nitpicks.\n\n'
+    if [ -n "$SPEC_CONTENT" ]; then
+      printf '=== INTENT (what this change is SUPPOSED to do) ===\n%s\n\n' "$SPEC_CONTENT"
+    fi
+    memory_section
+    printf 'Report each finding as one line, exactly:\n- [ ] CX-01 | BLOCKER|MAJOR|MINOR | <file>:<line> | <one-line summary>\nEnd with the single line: TOTAL: <n>   (0 if clean)\n\n'
+    printf '%s\n' "$GUARD_LINE"
+  } > "$instr"
+  local review_fast=() t0 rc
   [ -n "${CODEX_FAST:-}" ] && review_fast=(-c service_tier="priority")
-  codex exec review --uncommitted \
+  t0=$(date +%s 2>/dev/null || echo 0)
+  codex exec review --uncommitted - \
     -c sandbox_mode=read-only \
     -c windows.sandbox=unelevated \
     -c model_reasoning_effort="$CODEX_EFFORT" \
     -m "$CODEX_MODEL" \
     "${review_fast[@]}" \
-    -o "$out" > "$log" 2>&1
-  local rc=$?
+    --json \
+    -o "$out" < "$instr" > "$TASK_DIR/review.jsonl" 2> "$log"
+  rc=$?
+  if [ "$rc" -eq 2 ] && [ ! -s "$out" ]; then
+    # Older CLI rejects PROMPT together with --uncommitted — canned review fallback.
+    journal "codex self-review: custom prompt rejected (rc=2), falling back to canned review"
+    codex exec review --uncommitted \
+      -c sandbox_mode=read-only \
+      -c windows.sandbox=unelevated \
+      -c model_reasoning_effort="$CODEX_EFFORT" \
+      -m "$CODEX_MODEL" \
+      "${review_fast[@]}" \
+      -o "$out" > "$log" 2>&1
+    rc=$?
+    : > "$TASK_DIR/review.jsonl"
+  fi
+  local dur=$(( $(date +%s 2>/dev/null || echo 0) - t0 ))
   # `codex exec review` bypasses the bridge, so record its tokens here.
   command -v usage_record_codex >/dev/null 2>&1 \
-    && usage_record_codex "$CODEX_USAGE_LEDGER" review "" "$log" "$rc" "$CODEX_MODEL" 2>/dev/null || true
-  journal "codex self-review rc=$rc -> review.md"
+    && usage_record_codex "$CODEX_USAGE_LEDGER" review "$TASK_DIR/review.jsonl" "$log" "$rc" "$CODEX_MODEL" "$dur" 2>/dev/null || true
+  journal "codex self-review rc=$rc (${dur}s) -> review.md"
   return "$rc"
 }
 
@@ -694,7 +931,9 @@ print_duel_summary() {
   echo "artifacts: $TASK_DIR_REL  (transcript.md = full debate, final.md = answer)"
   echo "rounds run: $(cat "$ROUND_FILE" 2>/dev/null || echo 0)/$ROUNDS   end: $END_REASON"
   echo "status: $OVERALL_RESULT"
-  [ -s "$TASK_DIR/arbiter.md" ] && echo "arbiter: fresh-context ruling in $TASK_DIR_REL/arbiter.md"
+  if [ -s "$TASK_DIR/arbiter.md" ] || [ -s "$TASK_DIR/arbiter_claude.md" ]; then
+    echo "arbiter panel: rulings in $TASK_DIR_REL/arbiter.md (Codex) + arbiter_claude.md (Claude)"
+  fi
   if [ "$AUTO" -eq 1 ]; then
     if [ -s "$TASK_DIR/final.md" ]; then
       echo "NEXT: read $TASK_DIR_REL/final.md (converged answer); full debate in transcript.md"
@@ -708,12 +947,66 @@ print_duel_summary() {
   emit_token_summary
 }
 
+# Does the consult contain anything Claude must actually rule on?
+plan_gate_needed() {
+  local c="$TASK_DIR/consult.md" q ch
+  [ -s "$c" ] || return 1
+  grep -qiE 'OPEN QUESTIONS|PROPOSED SPEC CHANGES' "$c" || return 1
+  q="$(grep -iA3 'OPEN QUESTIONS' "$c" 2>/dev/null | tr -d '\r')"
+  ch="$(grep -iA3 'PROPOSED SPEC CHANGES' "$c" 2>/dev/null | tr -d '\r')"
+  if printf '%s' "$q" | grep -qiE '(^|[[:space:]"])none\b' \
+     && printf '%s' "$ch" | grep -qiE '(^|[[:space:]"])none\b'; then
+    return 1
+  fi
+  return 0
+}
+
 run_consult_build() {
+  # Cross-model test authorship first, so BOTH paths inject the tests into the
+  # implementation prompt (tests written by the non-implementing model do not
+  # share the implementation's blind spots).
+  if [ "$AUTHOR_TESTS" -eq 1 ]; then
+    echo "=== acceptance tests (Claude authors them before Codex codes) ==="
+    if ! run_claude_once "$TASK_DIR/acceptance_tests.md" "$TASK_DIR/acceptance_tests.log" prompt_author_tests author-tests; then
+      echo "codex_loop: WARNING: acceptance-test authoring failed; continuing without (see acceptance_tests.log)" >&2
+      rm -f "$TASK_DIR/acceptance_tests.md"
+    fi
+  fi
+
+  if [ "$QUICK" -eq 1 ]; then
+    echo "=== consult+build (merged fast path — one fresh Codex turn) ==="
+    if ! run_bridge build "$TASK_DIR/build.md" "$TASK_DIR/build.log" prompt_consult_build; then
+      OVERALL_RESULT="FAIL (build)"
+      FAILING_COMMAND="codex_bridge.sh build (quick)"
+      return 1
+    fi
+    # Artifact parity: extract the Phase-1 critique so memory/cross-review
+    # prompts keep working unmodified.
+    awk '/^=== PHASE 1/{f=1; next} /^=== PHASE 2/{f=0} f' "$TASK_DIR/build.md" > "$TASK_DIR/consult.md" 2>/dev/null || true
+    return 0
+  fi
+
   echo "=== consult (Codex critiques the plan) ==="
   if ! run_bridge consult "$TASK_DIR/consult.md" "$TASK_DIR/consult.log" prompt_consult; then
     OVERALL_RESULT="FAIL (consult)"
     FAILING_COMMAND="codex_bridge.sh consult"
     return 1
+  fi
+
+  # Plan gate: Claude rules on Codex's questions/spec changes BEFORE any code
+  # exists — the cheapest point in the pipeline to kill a wrong approach.
+  if [ "$PLAN_GATE" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    if plan_gate_needed; then
+      echo "=== plan gate (Claude rules on Codex's questions & spec changes) ==="
+      if run_claude_once "$TASK_DIR/answers.md" "$TASK_DIR/answers.log" prompt_plan_answers plan-answers; then
+        journal "plan gate: rulings recorded"
+      else
+        echo "codex_loop: WARNING: plan-gate call failed; Codex will self-answer (see answers.log)" >&2
+        rm -f "$TASK_DIR/answers.md"
+      fi
+    else
+      journal "plan gate: skipped (consult raised nothing to rule on)"
+    fi
   fi
 
   echo "=== build (Codex implements, threaded) ==="
@@ -724,6 +1017,63 @@ run_consult_build() {
   fi
 
   return 0
+}
+
+# Test + bounded repair loop with stall detection and an error-class effort
+# ladder. Returns 0 when green, 1 when the loop is exhausted or a call failed.
+run_fix_loop() {
+  local i=1 sig prev_sig="" escalated=0 fix_prompt
+
+  # Bonus ladder round: shallow error classes (syntax/import/name) repair at
+  # high rates — try ONE cheaper high-effort round that does not consume an
+  # xhigh round slot. Auto-effort only; an explicit --effort pins it off.
+  if [ "$EFFORT_SET" -eq 0 ] && [ "$CODEX_EFFORT" = "xhigh" ] && test_is_shallow "$TASK_DIR/test.log"; then
+    echo "=== fix round 0 (bonus, effort=high — shallow error class) ==="
+    journal "effort ladder: shallow error class -> bonus high-effort round"
+    prev_sig="$(test_sig "$TASK_DIR/test.log")"
+    if CODEX_EFFORT=high run_bridge build "$TASK_DIR/fix-r0.md" "$TASK_DIR/fix-r0.log" prompt_fix --resume; then
+      FIX_USED=$((FIX_USED + 1))
+      echo "=== re-test (after bonus round) ==="
+      TEST_RESULT="NOT RUN"; OVERALL_RESULT="PASS"; FAILING_COMMAND=""
+      run_test "$TASK_DIR/test.log" && return 0
+    fi
+  fi
+
+  while [ "$i" -le "$FIX_ROUNDS" ]; do
+    sig="$(test_sig "$TASK_DIR/test.log")"
+    fix_prompt=prompt_fix
+    if [ -n "$prev_sig" ] && [ "$sig" = "$prev_sig" ]; then
+      if [ "$escalated" -eq 0 ]; then
+        escalated=1
+        echo "=== fix round $i/$FIX_ROUNDS (ESCALATED — failure unchanged; pulling a cross-model diagnosis) ==="
+        journal "fix loop: identical failure signature -> escalating with cross-model diagnosis"
+        run_claude_once "$TASK_DIR/fix_diagnosis.md" "$TASK_DIR/fix_diagnosis.log" prompt_fix_diagnosis fix-diagnosis \
+          || rm -f "$TASK_DIR/fix_diagnosis.md"
+        fix_prompt=prompt_fix_escalated
+      else
+        journal "fix loop: failure signature unchanged twice -> stopping early (design problem, not a retry problem)"
+        OVERALL_RESULT="FAIL (test, stalled after $FIX_USED fix round(s))"
+        FAILING_COMMAND="$TEST_CMD"
+        return 1
+      fi
+    else
+      echo "=== fix round $i/$FIX_ROUNDS (test output fed back to Codex) ==="
+    fi
+    prev_sig="$sig"
+    if ! run_bridge build "$TASK_DIR/fix-r$i.md" "$TASK_DIR/fix-r$i.log" "$fix_prompt" --resume; then
+      OVERALL_RESULT="FAIL (fix round $i)"
+      FAILING_COMMAND="codex_bridge.sh build --resume (fix)"
+      return 1
+    fi
+    FIX_USED=$((FIX_USED + 1))
+    echo "=== re-test (after fix round $i) ==="
+    TEST_RESULT="NOT RUN"; OVERALL_RESULT="PASS"; FAILING_COMMAND=""
+    run_test "$TASK_DIR/test.log" && return 0
+    i=$((i + 1))
+  done
+  OVERALL_RESULT="FAIL (test, after $FIX_USED fix round(s))"
+  FAILING_COMMAND="$TEST_CMD"
+  return 1
 }
 
 run_build_mode() {
@@ -738,39 +1088,51 @@ run_build_mode() {
 
   # Test + bounded repair loop: a red test is the strongest ground-truth signal
   # the kit produces — feed it back into the SAME Codex thread instead of
-  # discarding it.
+  # discarding it. run_fix_loop adds stall detection + the effort ladder.
   if [ "$TEST_CMD_SET" -eq 1 ]; then
     echo "=== test ==="
     if ! run_test "$TASK_DIR/test.log"; then
-      i=1
-      while [ "$i" -le "$FIX_ROUNDS" ]; do
-        echo "=== fix round $i/$FIX_ROUNDS (test output fed back to Codex) ==="
-        if ! run_bridge build "$TASK_DIR/fix-r$i.md" "$TASK_DIR/fix-r$i.log" prompt_fix --resume; then
-          OVERALL_RESULT="FAIL (fix round $i)"
-          FAILING_COMMAND="codex_bridge.sh build --resume (fix)"
+      run_fix_loop || true
+      case "$OVERALL_RESULT" in
+        "FAIL (fix round"*)
+          # An infrastructure failure mid-loop aborts; an exhausted/stalled test
+          # loop deliberately CONTINUES into the reviews, which see test.log and
+          # attack the failure with fresh eyes.
           write_status
           print_build_summary
           return 1
-        fi
-        FIX_USED=$((FIX_USED + 1))
-        echo "=== re-test (after fix round $i) ==="
-        TEST_RESULT="NOT RUN"; OVERALL_RESULT="PASS"; FAILING_COMMAND=""
-        run_test "$TASK_DIR/test.log" && break
-        i=$((i + 1))
-      done
-      if [ "$TEST_RESULT" = "FAIL" ]; then
-        OVERALL_RESULT="FAIL (test, after $FIX_USED fix round(s))"
-        FAILING_COMMAND="$TEST_CMD"
-      fi
+          ;;
+      esac
     fi
   fi
 
-  echo "=== review (codex self-review, advisory) ==="
-  # Review is ADVISORY: `codex exec review` may exit non-zero simply because it
-  # found issues (that is the point), so never abort the loop on a non-zero exit.
-  # But distinguish "found issues" (review.md has content) from an infrastructure
-  # failure (empty review.md) so a CLI/auth/model error can't masquerade as PASS.
-  if ! run_review "$TASK_DIR/review.md" "$TASK_DIR/review.log"; then
+  # Reviews: the spec-aware Codex self-review and the headless-Claude
+  # cross-review are independent read-only passes over the same finished tree —
+  # run them CONCURRENTLY (they write disjoint artifacts; ledger/journal appends
+  # are single-line). Independence is deliberate: no cross-feeding, so their
+  # errors stay uncorrelated (duel round-0 rationale).
+  _rrc=0; _crc=1
+  if [ "$CLAUDE_REVIEW" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo "=== reviews (codex self-review + Claude cross-review, in parallel) ==="
+    CROSS_SID="$(mint_claude_sid)"
+    run_review "$TASK_DIR/review.md" "$TASK_DIR/review.log" & _rpid=$!
+    run_claude_once "$TASK_DIR/claude_review.md" "$TASK_DIR/claude_review.log" build_claude_review_prompt claude-review new "$CROSS_SID"
+    _crc=$?
+    wait "$_rpid"; _rrc=$?
+  else
+    echo "=== review (codex self-review, advisory) ==="
+    run_review "$TASK_DIR/review.md" "$TASK_DIR/review.log"; _rrc=$?
+    if [ "$CLAUDE_REVIEW" -eq 1 ]; then
+      echo "=== cross-review (headless Claude reviews Codex's diff) ==="
+      run_claude_once "$TASK_DIR/claude_review.md" "$TASK_DIR/claude_review.log" build_claude_review_prompt claude-review
+      _crc=$?
+    fi
+  fi
+
+  # Self-review is ADVISORY on exit code (a non-zero exit can just mean "found
+  # issues"), but an EMPTY review + non-zero exit is an infrastructure failure
+  # that must not masquerade as PASS.
+  if [ "$_rrc" -ne 0 ]; then
     if [ -s "$TASK_DIR/review.md" ]; then
       echo "codex_loop: review reported findings (non-zero exit); see $TASK_DIR_REL/review.md" >&2
     else
@@ -778,37 +1140,71 @@ run_build_mode() {
       echo "codex_loop: WARNING: review produced no output and exited non-zero — likely a CLI/auth/model error, NOT a clean result; see $TASK_DIR_REL/review.log" >&2
     fi
   fi
+  [ "$CLAUDE_REVIEW" -eq 1 ] && [ "$_crc" -ne 0 ] \
+    && echo "codex_loop: WARNING: claude cross-review failed; see $TASK_DIR_REL/claude_review.log" >&2
 
-  # Cross-review: PROTOCOL says the OTHER model reviews the diff. The self-review
-  # above shares Codex's blind spots; a scripted headless-Claude review does not
-  # (and finally records Claude-side tokens in build mode). Findings go BACK to
-  # the same Codex thread for a fix-or-rebut round: nothing is silently dropped.
+  # Fix-or-rebut round: Claude's CX findings AND the self-review's findings
+  # (renumbered SX so ids never collide) both go back to the SAME Codex thread —
+  # nothing from either review can be silently dropped.
   if [ "$CLAUDE_REVIEW" -eq 1 ]; then
-    echo "=== cross-review (headless Claude reviews Codex's diff) ==="
-    if run_claude_once "$TASK_DIR/claude_review.md" "$TASK_DIR/claude_review.log" build_claude_review_prompt claude-review; then
+    rm -f "$TASK_DIR/self_findings.md"
+    if [ -s "$TASK_DIR/review.md" ] && tr -d '\r' < "$TASK_DIR/review.md" | grep -aqE '^[[:space:]]*-[[:space:]]*\[.\][[:space:]]*(\*\*|`)?CX-[0-9]+'; then
+      sed -E 's/CX-([0-9]+)/SX-\1/g' "$TASK_DIR/review.md" > "$TASK_DIR/self_findings.md"
+    fi
+    nfind=0
+    if [ "$_crc" -eq 0 ]; then
       nfind="$(grep -aoE 'FINDINGS TOTAL: *[0-9]+' "$TASK_DIR/claude_review.md" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)"
-      if [ -z "$nfind" ]; then
-        nfind="$(grep -acE '^- \[ \] CX-[0-9]+' "$TASK_DIR/claude_review.md" 2>/dev/null || true)"
-      fi
+      [ -z "$nfind" ] && nfind="$(grep -acE '^- \[.\] CX-[0-9]+' "$TASK_DIR/claude_review.md" 2>/dev/null || true)"
       nfind="${nfind:-0}"
-      journal "claude cross-review findings: $nfind"
-      if [ "$nfind" -gt 0 ] 2>/dev/null; then
-        echo "=== codex response round (fix-or-rebut Claude's $nfind finding(s)) ==="
-        if ! run_bridge build "$TASK_DIR/codex_response.md" "$TASK_DIR/codex_response.log" prompt_codex_response --resume; then
-          OVERALL_RESULT="FAIL (codex response)"
-          FAILING_COMMAND="codex_bridge.sh build --resume (response)"
-          write_status
-          print_build_summary
-          return 1
-        fi
-        if [ "$TEST_CMD_SET" -eq 1 ]; then
-          echo "=== final re-test (after response round) ==="
-          TEST_RESULT="NOT RUN"
-          run_test "$TASK_DIR/test.log" || OVERALL_RESULT="FAIL (test after response round)"
+    fi
+    journal "reviews: claude findings=$nfind self-findings=$([ -s "$TASK_DIR/self_findings.md" ] && echo yes || echo no)"
+    if [ "$nfind" -gt 0 ] 2>/dev/null || [ -s "$TASK_DIR/self_findings.md" ]; then
+      echo "=== codex response round (fix-or-rebut all findings) ==="
+      if ! run_bridge build "$TASK_DIR/codex_response.md" "$TASK_DIR/codex_response.log" prompt_codex_response --resume; then
+        OVERALL_RESULT="FAIL (codex response)"
+        FAILING_COMMAND="codex_bridge.sh build --resume (response)"
+        write_status
+        print_build_summary
+        return 1
+      fi
+
+      # Post-response verify: the SAME cross-reviewer (resumed session — it
+      # holds its own findings in-context) refutes each FIXED claim against the
+      # current diff. Guard already has this closure; build gets it too.
+      if [ "$DRY_RUN" -eq 0 ] && [ -n "$CROSS_SID" ] \
+         && tr -d '\r' < "$TASK_DIR/codex_response.md" | grep -aqE '(CX|SX)-[0-9]+ *-> *FIXED'; then
+        echo "=== post-response verify (cross-reviewer refutes the FIXED claims) ==="
+        if run_claude_once "$TASK_DIR/build_verify.md" "$TASK_DIR/build_verify.log" prompt_build_verify build-verify resume "$CROSS_SID"; then
+          vline="$(tr -d '\r' < "$TASK_DIR/build_verify.md" | grep -aoE 'VERDICT: *[A-Z].*' | tail -1)"
+          journal "build verify verdict: ${vline:-none}"
+          case "$vline" in
+            *REOPEN*)
+              printf '%s\n' "$vline" | grep -oE '(CX|SX)-[0-9]+' | sort -u > "$TASK_DIR/reopened.txt"
+              echo "=== reopen round (scoped to: $(tr '\n' ' ' < "$TASK_DIR/reopened.txt")) ==="
+              if run_bridge build "$TASK_DIR/codex_reopen.md" "$TASK_DIR/codex_reopen.log" prompt_codex_reopen --resume; then
+                OVERALL_RESULT="PASS (verify reopened: $(tr '\n' ' ' < "$TASK_DIR/reopened.txt")— Codex responded; adjudicate codex_reopen.md)"
+              else
+                OVERALL_RESULT="FAIL (reopen round)"
+                FAILING_COMMAND="codex_bridge.sh build --resume (reopen)"
+              fi
+              ;;
+          esac
+        else
+          echo "codex_loop: WARNING: post-response verify failed; see $TASK_DIR_REL/build_verify.log" >&2
         fi
       fi
-    else
-      echo "codex_loop: WARNING: claude cross-review failed; see $TASK_DIR_REL/claude_review.log" >&2
+
+      if [ "$TEST_CMD_SET" -eq 1 ]; then
+        echo "=== final re-test ==="
+        _pre_fail=""
+        case "$OVERALL_RESULT" in FAIL*) _pre_fail="$OVERALL_RESULT" ;; esac
+        TEST_RESULT="NOT RUN"
+        if ! run_test "$TASK_DIR/test.log"; then
+          OVERALL_RESULT="FAIL (test after response round)"
+        elif [ -n "$_pre_fail" ]; then
+          OVERALL_RESULT="$_pre_fail"
+        fi
+      fi
     fi
   fi
 
@@ -818,9 +1214,42 @@ run_build_mode() {
   case "$OVERALL_RESULT" in PASS*) return 0 ;; *) return 1 ;; esac
 }
 
+# Guard state that must survive to the separate --step verify process
+# (mirrors the duel.env pattern).
+TEST_RESULT_REVIEW=""
+save_guard_env() {
+  {
+    printf 'TEST_CMD=%q\n' "$TEST_CMD"
+    printf 'TEST_RESULT_REVIEW=%q\n' "$TEST_RESULT_REVIEW"
+  } > "$TASK_DIR/guard.env" 2>/dev/null || true
+}
+load_guard_env() {
+  [ -f "$TASK_DIR/guard.env" ] || return 0
+  eval "$(sed 's/^/G_/' "$TASK_DIR/guard.env")"
+  if [ "$TEST_CMD_SET" -eq 0 ] && [ -n "${G_TEST_CMD:-}" ]; then
+    TEST_CMD="$G_TEST_CMD"
+    TEST_CMD_SET=1
+  fi
+  TEST_RESULT_REVIEW="${G_TEST_RESULT_REVIEW:-}"
+  return 0
+}
+
 run_guard_verify() {
   [ -s "$TASK_DIR/findings.md" ] || die "no findings.md for task $TASK_ID — run the guard review first"
   [ -s "$TASK_DIR/reconciliation.md" ] || die "write $TASK_DIR_REL/reconciliation.md first: one line per finding, 'CX-NN: FIXED — <what>' or 'CX-NN: WAIVED — <reason>'"
+
+  # Completeness gate BEFORE the paid call: every CX id in the ledger needs a
+  # ruling — a silently skipped finding is exactly what this mode exists to stop.
+  local missing
+  missing="$(recon_missing "$TASK_DIR/findings.md" "$TASK_DIR/reconciliation.md" | tr '\n' ' ')"
+  [ -z "$missing" ] || die "reconciliation.md has NO ruling for: $missing— add 'CX-NN: FIXED — …' or 'CX-NN: WAIVED — …' for each"
+
+  load_guard_env
+  if [ "$TEST_CMD_SET" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo "=== test (after Claude's fixes — regression ground truth) ==="
+    run_test "$TASK_DIR/test_verify.log" || true
+    OVERALL_RESULT="PASS"; FAILING_COMMAND=""   # the transition is evidence for the verifier, not a loop failure
+  fi
 
   echo "=== verify (threaded — Codex re-checks Claude's fixes and waivers) ==="
   if ! run_bridge consult "$TASK_DIR/verify.md" "$TASK_DIR/verify.log" prompt_guard_verify --resume; then
@@ -830,6 +1259,17 @@ run_guard_verify() {
     print_guard_summary
     return 1
   fi
+
+  # Machine-visible verdict: one nudge if the reply forgot the VERDICT line.
+  if [ "$DRY_RUN" -eq 0 ] && ! tr -d '\r' < "$TASK_DIR/verify.md" | grep -aqE 'VERDICT: *[A-Z]'; then
+    echo "=== verdict nudge (reply lacked the VERDICT line) ==="
+    if run_bridge consult "$TASK_DIR/verify_verdict.md" "$TASK_DIR/verify_verdict.log" prompt_verdict_nudge --resume; then
+      { printf '\n'; cat "$TASK_DIR/verify_verdict.md"; } >> "$TASK_DIR/verify.md"
+    else
+      echo "codex_loop: WARNING: verdict nudge failed — read verify.md yourself" >&2
+    fi
+  fi
+
   write_status
   memory_append_run
   print_guard_summary
@@ -861,6 +1301,17 @@ run_guard_mode() {
     return 2
   fi
 
+  # Execution ground truth BEFORE the review: a failing test is the reviewer's
+  # strongest lead, and the review-time result becomes the baseline the verify
+  # step judges regressions against.
+  if [ "$TEST_CMD_SET" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo "=== test (ground truth for the reviewer) ==="
+    run_test "$TASK_DIR/test_review.log" || true
+    TEST_RESULT_REVIEW="$TEST_RESULT"
+    OVERALL_RESULT="PASS"; FAILING_COMMAND=""   # a red test here is evidence for the reviewer, not a guard failure
+  fi
+  save_guard_env
+
   # Round 1 is a FRESH bridge consult (the bridge captures its session id), so
   # later rounds' --resume thread off THIS review rather than a stale prior
   # session (a direct `codex exec review` bypasses the bridge and never records
@@ -881,6 +1332,27 @@ run_guard_mode() {
     write_status
     print_guard_summary
     return 1
+  fi
+
+  # Ledger lint: validate the CX grammar + that every file:line actually exists.
+  # ONE reformat nudge on violation; never die after paid calls.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    viol="$(lint_findings "$TASK_DIR/findings.md" "$REPO_ROOT")"
+    if [ -n "$viol" ]; then
+      printf '%s\n' "$viol" > "$TASK_DIR/lint.txt"
+      journal "findings lint: $(printf '%s\n' "$viol" | grep -c .) violation(s) -> one reformat nudge"
+      echo "=== findings lint failed — one reformat nudge ==="
+      if run_bridge consult "$TASK_DIR/findings2.md" "$TASK_DIR/findings2.log" prompt_findings_nudge --resume; then
+        viol2="$(lint_findings "$TASK_DIR/findings2.md" "$REPO_ROOT")"
+        if [ -z "$viol2" ]; then
+          cp "$TASK_DIR/findings.md" "$TASK_DIR/findings.raw.md"
+          cp "$TASK_DIR/findings2.md" "$TASK_DIR/findings.md"
+          journal "findings lint: nudged ledger adopted (original kept as findings.raw.md)"
+        else
+          echo "codex_loop: WARNING: findings ledger still violates the grammar after one nudge — proceeding as-is (see lint.txt)" >&2
+        fi
+      fi
+    fi
   fi
 
   write_status
@@ -911,8 +1383,9 @@ SID_FILE="$TASK_DIR/claude_session_id"
 END_REASON="round-cap"
 
 # Persona injected into every headless Claude turn (no apostrophes -> safe to
-# keep single-quoted).
-CLAUDE_PERSONA='You are the CLAUDE participant in a two-model mutual-critique debate with Codex (a GPT model). Each round: (1) share ALL new findings/evidence with file:line or URLs — hold nothing back, your counterpart must see everything you saw; (2) critique the SPECIFIC claims Codex made and say why; (3) revise your own position and concede what you got wrong; (4) give your current best answer. Be terse and concrete. End every turn with the line "DISAGREEMENTS REMAINING: <n>" listing n concrete points. If nothing material remains to add AND n=0, output the single line CONVERGED as the very last line.'
+# keep single-quoted; DX_GRAMMAR/EVIDENCE_LINE are appended and are also
+# apostrophe-free).
+CLAUDE_PERSONA='You are the CLAUDE participant in a two-model mutual-critique debate with Codex (a GPT model). Each round: (1) share ALL new findings/evidence — hold nothing back, your counterpart must see everything you saw; (2) critique the SPECIFIC claims Codex made and say why; (3) revise your own position and concede what you got wrong — but ONLY when new evidence supports it, never to be agreeable; confirm what is correct instead of hunting for disagreement; (4) give your current best answer. Be terse and concrete. '"$DX_GRAMMAR $EVIDENCE_LINE"' If nothing material remains to add AND the ledger has zero OPEN points, output the single line CONVERGED as the very last line.'
 
 # A headless `claude -p` aborts with a nesting guard when CLAUDECODE et al. are
 # inherited from this live session. Stripping these (verified on this box) lets
@@ -951,12 +1424,16 @@ inp = g("input_tokens")
 cached = g("cache_read_input_tokens") + g("cache_creation_input_tokens")
 out = g("output_tokens")
 try:
+    secs = str(int(round((d.get("duration_ms") or 0) / 1000)))
+except Exception:
+    secs = ""
+try:
     with open(ledger, "a", encoding="utf-8") as f:
         f.write("\t".join([str(int(time.time())),
                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                            "claude", model, label,
                            str(inp + cached + out), str(inp), str(cached), str(out),
-                           "0"]) + "\n")
+                           "0", secs]) + "\n")
 except Exception:
     pass
 print("ok")
@@ -965,10 +1442,14 @@ PYEOF
   [ "$res" = "ok" ]
 }
 
-# ONE fresh headless-Claude call (no session threading): used for the build-mode
-# cross-review. Prompt persists as a task artifact; usage lands in the ledger.
+# ONE headless-Claude call. Optional session threading via $5/$6:
+#   run_claude_once out log builder label            -> stateless (fresh context)
+#   run_claude_once out log builder label new $sid   -> start session $sid
+#   run_claude_once out log builder label resume $sid-> resume session $sid
+# (the build-mode cross-reviewer starts a session so the post-response verify
+# can resume it with its own findings still in context)
 run_claude_once() {
-  local out="$1" log="$2" builder="$3" label="$4" rc
+  local out="$1" log="$2" builder="$3" label="$4" smode="${5:-}" sid="${6:-}" rc
   local pfile="$PROMPTS_DIR/${label}.prompt.md"
   "$builder" > "$pfile"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -977,11 +1458,17 @@ run_claude_once() {
     return 0
   fi
   command -v claude >/dev/null 2>&1 || { echo "codex_loop: claude CLI not found — skipping $label" >&2; return 1; }
+  local idflag=()
+  case "$smode" in
+    new)    [ -n "$sid" ] && idflag=(--session-id "$sid") ;;
+    resume) [ -n "$sid" ] && idflag=(--resume "$sid") ;;
+  esac
   local modelflag=();  [ -n "$CLAUDE_MODEL" ] && modelflag=(--model "$CLAUDE_MODEL")
   local budgetflag=(); [ -n "$BUDGET_USD" ]   && budgetflag=(--max-budget-usd "$BUDGET_USD")
   if [ -n "$CLAUDE_USAGE_PY" ]; then
     local jtmp; jtmp="$(mktemp)"
     claude_headless -p \
+        "${idflag[@]}" \
         --permission-mode plan \
         --tools "Read" "Grep" "Glob" \
         --effort "$(claude_effort)" \
@@ -993,6 +1480,7 @@ run_claude_once() {
     rm -f "$jtmp"
   else
     claude_headless -p \
+        "${idflag[@]}" \
         --permission-mode plan \
         --tools "Read" "Grep" "Glob" \
         --effort "$(claude_effort)" \
@@ -1004,6 +1492,80 @@ run_claude_once() {
   journal "claude $label rc=$rc -> $(basename "$out")"
   [ "$rc" -ne 0 ] && return "$rc"
   [ -s "$out" ] || return 99
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Mechanical citation verification (zero model calls). Checks every
+# 'EVIDENCE: <path>:<line> "<quote>"' in a turn against the actual files
+# (repo root, plus the worktree in --code duels). Failures-only reporting:
+# a clean pass injects nothing.
+# $1 = turn file, $2 = failures output file; prints the failure count.
+cite_check() {
+  : > "$2"
+  if [ -z "$CLAUDE_USAGE_PY" ] || [ ! -f "$1" ]; then
+    echo 0
+    return 0
+  fi
+  local roots=("$REPO_ROOT")
+  [ "$CODE" -eq 1 ] && [ -e "$DUEL_WORKTREE" ] && roots+=("$DUEL_WORKTREE")
+  "$CLAUDE_USAGE_PY" - "$1" "$2" "${roots[@]}" <<'PYEOF' 2>/dev/null || { : > "$2"; echo 0; }
+import os, re, sys
+turn, out = sys.argv[1], sys.argv[2]
+roots = sys.argv[3:]
+fails = []
+txt = open(turn, encoding="utf-8", errors="replace").read()
+for m in re.finditer(r'EVIDENCE:\s*(\S+?):(\d+)\s+"([^"]{1,200})"', txt):
+    path, line, quote = m.group(1), int(m.group(2)), m.group(3)
+    if path.startswith("http"):
+        continue
+    ok = False
+    for r in roots:
+        p = os.path.join(r, path)
+        if not os.path.isfile(p):
+            continue
+        try:
+            body = open(p, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        lines = body.splitlines()
+        if line <= len(lines):
+            lo = max(0, line - 11)
+            hi = min(len(lines), line + 10)
+            if not quote.strip() or quote in "\n".join(lines[lo:hi]):
+                ok = True
+                break
+        # line drifted (edits between rounds): accept a whole-file hit
+        if quote.strip() and quote in body:
+            ok = True
+            break
+    if not ok:
+        fails.append('%s:%d "%s"' % (path, line, quote[:80]))
+with open(out, "w", encoding="utf-8") as f:
+    f.write("\n".join(fails) + ("\n" if fails else ""))
+print(len(fails))
+PYEOF
+}
+
+# Post-turn bookkeeping for one duel side: verify citations (failures go to the
+# COUNTERPART's next prompt) and detect ledger points that silently vanished
+# (the nudge goes back to the SAME side's next prompt).
+# $1 = side (claude|codex), $2 = round number
+duel_post_turn() {
+  local side="$1" rnd="$2" cur prev nfails vanished
+  cur="$ROUNDS_DIR/$(rr "$rnd")-$side.md"
+  nfails="$(cite_check "$cur" "$TASK_DIR/citefail-$side.md")"
+  [ "$nfails" -gt 0 ] 2>/dev/null && journal "cite check: $nfails citation(s) from $side failed verification (round $rnd)"
+  if [ "$rnd" -ge 1 ]; then
+    prev="$ROUNDS_DIR/$(rr $((rnd - 1)))-$side.md"
+    vanished="$(dx_vanished "$prev" "$cur" | tr '\n' ' ')"
+    if [ -n "$vanished" ]; then
+      printf '%s\n' "$vanished" > "$TASK_DIR/nudge-$side.md"
+      journal "dx ledger: $side dropped without resolution: $vanished(round $rnd)"
+    else
+      rm -f "$TASK_DIR/nudge-$side.md" 2>/dev/null
+    fi
+  fi
   return 0
 }
 
@@ -1045,11 +1607,12 @@ build_codex_prompt() {
   local rnd="$1" claude_msg="$2"
   printf 'You and Claude independently solve the SAME task, then CRITIQUE each other every round to converge on ONE cross-checked answer. This is round %s of %s.\n\n' "$rnd" "$ROUNDS"
   if [ -n "$claude_msg" ] && [ -f "$claude_msg" ]; then
-    printf 'Do your OWN reasoning first, then critique the latest Claude message below: name concrete errors, missed cases, better sources/approaches, AND anything Claude got right that you would adopt.\n'
+    printf 'Do your OWN reasoning first, then critique the latest Claude message below: name concrete errors, missed cases, better sources/approaches, AND anything Claude got right that you would adopt. Concede ONLY when new evidence supports it — never to be agreeable; confirm what is correct instead of hunting for disagreement.\n'
   else
     printf 'This round is INDEPENDENT: you have NOT seen Claude'\''s answer and must not guess at it. Solve the task from scratch with your own reasoning and evidence; you will see and critique Claude from round 1.\n'
   fi
-  printf 'Share ALL evidence you rely on (file:line, URLs, command results) — your counterpart must see everything you saw. End with (a) your current best answer, (b) a short "DISAGREEMENTS REMAINING" list (write "none yet" in an independent round), and if nothing material remains to add, the SINGLE line %s as the very last line.\n\n' "$CONV_TOKEN"
+  printf '%s\n%s\n' "$DX_GRAMMAR" "$EVIDENCE_LINE"
+  printf 'End with (a) your current best answer, (b) your DX ledger (in an independent round, open a DX line for anything you expect to be contested). If nothing material remains AND the ledger has zero OPEN points, output the SINGLE line %s as the very last line.\n\n' "$CONV_TOKEN"
   printf '%s\n' "$GUARD_LINE"
   printf 'Do not run install commands, dev servers, or full builds.\n\n'
   memory_section
@@ -1069,10 +1632,19 @@ build_codex_prompt() {
 }
 
 # Resume Codex prompt (rounds >= 1): Codex remembers prior rounds via its session,
-# so feed ONLY the newest Claude message + the instruction.
+# so feed ONLY the newest Claude message + bookkeeping (its own vanished-point
+# nudge, and the counterpart's FAILED citations).
 build_codex_resume_prompt() {
   local rnd="$1" claude_msg="$2"
-  printf 'Round %s of %s. Claude just replied below. Do your own check first, then critique it, adopt/fix as warranted, and give your updated best answer plus a short "DISAGREEMENTS REMAINING" list. Share ALL new evidence (file:line, URLs, command results). If nothing material remains AND the disagreement count is 0, output the SINGLE line %s as the very last line.\n\n' "$rnd" "$ROUNDS" "$CONV_TOKEN"
+  printf 'Round %s of %s. Claude just replied below. Do your own check first, then critique it, adopt/fix as warranted (concede ONLY on new evidence, never to be agreeable), and give your updated best answer plus your updated DX ledger. %s If nothing material remains AND the ledger has zero OPEN points, output the SINGLE line %s as the very last line.\n\n' "$rnd" "$ROUNDS" "$EVIDENCE_LINE" "$CONV_TOKEN"
+  if [ -s "$TASK_DIR/nudge-codex.md" ]; then
+    printf 'MISSING FROM YOUR LEDGER (was OPEN, then silently vanished — resolve or restate each): %s\n\n' "$(tr '\n' ' ' < "$TASK_DIR/nudge-codex.md")"
+  fi
+  if [ -s "$TASK_DIR/citefail-claude.md" ]; then
+    printf 'CITATION CHECK: these citations from your counterpart did NOT verify against the actual files — treat those claims as UNPROVEN and re-check them yourself:\n'
+    cat "$TASK_DIR/citefail-claude.md"
+    printf '\n'
+  fi
   printf '%s\n\n' "$GUARD_LINE"
   if [ "$CODE" -eq 1 ] && [ -e "$DUEL_WORKTREE" ]; then
     printf '=== CURRENT WORKTREE DIFF vs %s ===\n' "$BASE"
@@ -1083,17 +1655,30 @@ build_codex_resume_prompt() {
   truncate_bytes "$claude_msg" "$MAX_BYTES"
 }
 
+# Red-team falsification prompt (one exchange before convergence is honored —
+# sycophantic capitulation is the dominant debate failure mode).
+build_codex_redteam_prompt() {
+  local rnd="$1" claude_msg="$2"
+  printf 'Round %s: you and Claude AGREE. Before this consensus stands, ATTACK it: hunt for concrete failure scenarios, counter-examples, edge cases, or contrary evidence (cite per the evidence grammar). List the specific attack angles you tried. Re-converging after a FAILED attack is the correct outcome, not a defeat — if every attack fails, say so explicitly, set every DX point to AGREED, and re-output the SINGLE line %s as the very last line. If an attack lands, reopen it as an OPEN DX point with evidence.\n\n' "$rnd" "$CONV_TOKEN"
+  printf '%s\n\n' "$GUARD_LINE"
+  printf '=== LATEST CLAUDE MESSAGE (their attack round, may be truncated) ===\n'
+  truncate_bytes "$claude_msg" "$MAX_BYTES"
+}
+
 # Run ONE Codex turn via the bridge (prompt persisted per round; no inline
 # injection). In --code, run with cwd = the worktree so Codex edits land THERE.
 # SAFETY: with --code the worktree MUST exist — otherwise 'build' mode would
 # give Codex workspace-write on the user's MAIN tree.
 # $1=round $2=resume(0|1) $3=path-to-latest-claude-message (empty = independent)
+# $4=variant ("redteam" selects the falsification prompt)
 run_codex_turn() {
-  local rnd="$1" resume="$2" claude_msg="$3" out log pfile rc
+  local rnd="$1" resume="$2" claude_msg="$3" variant="${4:-}" out log pfile rc
   out="$ROUNDS_DIR/$(rr "$rnd")-codex.md"
   log="$ROUNDS_DIR/$(rr "$rnd")-codex.log"
   pfile="$ROUNDS_DIR/$(rr "$rnd")-codex.prompt.md"
-  if [ "$resume" -eq 1 ]; then
+  if [ "$variant" = "redteam" ]; then
+    build_codex_redteam_prompt "$rnd" "$claude_msg" > "$pfile"
+  elif [ "$resume" -eq 1 ]; then
     build_codex_resume_prompt "$rnd" "$claude_msg" > "$pfile"
   else
     build_codex_prompt "$rnd" "$claude_msg" > "$pfile"
@@ -1127,11 +1712,25 @@ append_transcript() {
   { printf '\n## Round %s — %s\n\n' "$rnd" "$who"; cat "$file" 2>/dev/null; } >> "$TRANSCRIPT"
 }
 
+# One side is settled when it emitted the token AND (if it maintains a DX
+# ledger) has zero OPEN points — a CONVERGED line under a ledger that still
+# lists open disagreements is NOT convergence. Token-only fallback (with a
+# journal warning) when a side emitted no ledger at all.
+side_settled() {
+  local f="$1"
+  converged_side "$f" || return 1
+  if [ -n "$(dx_lines "$f" | head -1)" ]; then
+    [ "$(dx_open_count "$f")" -eq 0 ]
+  else
+    journal "convergence: $(basename "$f") has no DX ledger — token-only fallback"
+  fi
+}
+
 # Both sides of round r converged? (checks the per-round files, not the mutable
 # *_latest.md copies, so me-driven consumption can't break detection)
 round_converged() {
   local r="$1"
-  converged_side "$ROUNDS_DIR/$(rr "$r")-claude.md" && converged_side "$ROUNDS_DIR/$(rr "$r")-codex.md"
+  side_settled "$ROUNDS_DIR/$(rr "$r")-claude.md" && side_settled "$ROUNDS_DIR/$(rr "$r")-codex.md"
 }
 
 # Run ONE headless Claude turn. Prompt persisted per round (NOT a pipe) so a
@@ -1200,13 +1799,28 @@ claude_stdin_round0() {
   cat "$SEED_STORE" 2>/dev/null
   printf '\n\n=== TASK ===\n'
   cat "$PROMPT_STORE"
-  printf '\n\n=== YOUR TURN (round %s of %s — INDEPENDENT) ===\nDo your own independent research and give your opening position. You have NOT seen Codex'\''s answer; you will see and critique it from round 1. Do not output %s in this round.\n' "$1" "$ROUNDS" "$CONV_TOKEN"
+  printf '\n\n=== YOUR TURN (round %s of %s — INDEPENDENT) ===\nDo your own independent research and give your opening position, including your DX ledger (open a DX line for anything you expect to be contested). You have NOT seen Codex'\''s answer; you will see and critique it from round 1. Do not output %s in this round.\n' "$1" "$ROUNDS" "$CONV_TOKEN"
 }
 
 claude_stdin_resume() {
   local rnd="$1"
-  printf 'Round %s of %s. Codex just replied below. Do your OWN check first, then critique its SPECIFIC claims, fix/adopt what is warranted, and give your updated best answer. Share ALL new evidence. End with "DISAGREEMENTS REMAINING: <n>"; if nothing material remains AND n=0, output the SINGLE line %s as the very last line.\n\n' "$rnd" "$ROUNDS" "$CONV_TOKEN"
+  printf 'Round %s of %s. Codex just replied below. Do your OWN check first, then critique its SPECIFIC claims, fix/adopt what is warranted (concede ONLY on new evidence, never to be agreeable), and give your updated best answer plus your updated DX ledger. If nothing material remains AND the ledger has zero OPEN points, output the SINGLE line %s as the very last line.\n\n' "$rnd" "$ROUNDS" "$CONV_TOKEN"
+  if [ -s "$TASK_DIR/nudge-claude.md" ]; then
+    printf 'MISSING FROM YOUR LEDGER (was OPEN, then silently vanished — resolve or restate each): %s\n\n' "$(tr '\n' ' ' < "$TASK_DIR/nudge-claude.md")"
+  fi
+  if [ -s "$TASK_DIR/citefail-codex.md" ]; then
+    printf 'CITATION CHECK: these citations from your counterpart did NOT verify against the actual files — treat those claims as UNPROVEN and re-check them yourself:\n'
+    cat "$TASK_DIR/citefail-codex.md"
+    printf '\n'
+  fi
   printf '=== CODEX LATEST (may be truncated) ===\n'
+  truncate_bytes "$CODEX_LATEST" "$MAX_BYTES"
+}
+
+claude_stdin_redteam() {
+  local rnd="$1"
+  printf 'Round %s: you and Codex AGREE. Before this consensus stands, ATTACK it: hunt for concrete failure scenarios, counter-examples, edge cases, or contrary evidence (cite per the evidence grammar). List the attack angles you tried. Re-converging after a FAILED attack is the correct outcome, not a defeat — if every attack fails, say so explicitly, set every DX point to AGREED, and output the SINGLE line %s as the very last line. If an attack lands, reopen it as an OPEN DX point with evidence.\n\n' "$rnd" "$CONV_TOKEN"
+  printf '=== CODEX LATEST (the consensus you are attacking, may be truncated) ===\n'
   truncate_bytes "$CODEX_LATEST" "$MAX_BYTES"
 }
 
@@ -1235,21 +1849,30 @@ write_duel_status() {
   } > "$TASK_DIR/status.md"
 }
 
-# Fresh-context arbiter: a debate participant judging its own disagreements is
-# anchored toward its own positions; on non-convergence a NEW Codex session
-# (separate bridge dir — deliberately NOT --resume) rules on each remaining
-# disagreement from the task + both final positions only.
+# Fresh-context arbiter PANEL: a debate participant judging its own
+# disagreements is anchored toward its own positions, and a single judge
+# carries self-preference bias — so on non-convergence BOTH model families rule
+# concurrently on an ANONYMIZED docket (identity labels measurably skew
+# rulings). Panel agreement = binding; disagreement = UNRESOLVED with both
+# rulings shown.
 ARB_CLAUDE_FILE=""
 ARB_CODEX_FILE=""
 prompt_arbiter() {
-  printf 'You are a FRESH, INDEPENDENT arbiter. Claude and Codex debated the task below and did NOT fully converge. You did NOT participate and have no stake in either position. For EACH remaining disagreement: rule which position is correct (or that neither is), citing CHECKABLE evidence (a file:line you can read, or a URL). Do NOT split the difference. If the available evidence cannot settle a point, say exactly what evidence would.\n\n'
+  printf 'You are a FRESH, INDEPENDENT arbiter. Two AI assistants debated the task below and did NOT fully converge. You did NOT participate, have no stake, and are not told which assistant is which. For EACH remaining disagreement (see the DX docket and both positions): rule which position is correct — or state explicitly that NEITHER is settled by the available evidence — citing CHECKABLE evidence (a file:line you can read, or a URL). Do NOT split the difference; do NOT reward confidence or verbosity. If evidence cannot settle a point, say exactly what evidence would.\n\n'
   printf '%s\n\n' "$GUARD_LINE"
   memory_section
   printf '=== TASK ===\n'
   cat "$PROMPT_STORE" 2>/dev/null
-  printf '\n\n=== FINAL CLAUDE POSITION ===\n'
+  printf '\n\n=== DX DOCKET (open points, as each side last stated them) ===\n'
+  { dx_lines "$ARB_CLAUDE_FILE"; dx_lines "$ARB_CODEX_FILE"; } | sort -u
+  if [ -s "$TASK_DIR/citefail-claude.md" ] || [ -s "$TASK_DIR/citefail-codex.md" ]; then
+    printf '\n=== FAILED CITATIONS (mechanically checked — treat these claims as unproven) ===\n'
+    [ -s "$TASK_DIR/citefail-claude.md" ] && { printf 'from position A:\n'; cat "$TASK_DIR/citefail-claude.md"; }
+    [ -s "$TASK_DIR/citefail-codex.md" ] && { printf 'from position B:\n'; cat "$TASK_DIR/citefail-codex.md"; }
+  fi
+  printf '\n=== POSITION A ===\n'
   truncate_bytes "$ARB_CLAUDE_FILE" "$MAX_BYTES"
-  printf '\n\n=== FINAL CODEX POSITION ===\n'
+  printf '\n\n=== POSITION B ===\n'
   truncate_bytes "$ARB_CODEX_FILE" "$MAX_BYTES"
 }
 
@@ -1258,22 +1881,24 @@ run_arbiter() {
   ARB_CLAUDE_FILE="$(ls "$ROUNDS_DIR"/*-claude.md 2>/dev/null | tail -1)"
   ARB_CODEX_FILE="$(ls "$ROUNDS_DIR"/*-codex.md 2>/dev/null | tail -1)"
   { [ -n "$ARB_CLAUDE_FILE" ] && [ -n "$ARB_CODEX_FILE" ]; } || return 0
-  echo "=== arbiter (fresh-context Codex judge on the unresolved points) ==="
+  echo "=== arbiter panel (fresh-context Codex + Claude rule in parallel, anonymized docket) ==="
   local pfile="$PROMPTS_DIR/arbiter.prompt.md"
   prompt_arbiter > "$pfile"
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "DRY-RUN: would run a fresh-context arbiter consult; prompt at $pfile"
+    echo "DRY-RUN: would run the two-model arbiter panel; prompt at $pfile"
     return 0
   fi
   local adir="$TASK_DIR/bridge-arbiter" rc
   mkdir -p "$adir"
-  CODEX_USAGE_LABEL="duel-arbiter" CODEX_BRIDGE_DIR="$adir" bash "$BRIDGE" consult < "$pfile" > "$TASK_DIR/arbiter.log" 2>&1
-  rc=$?
+  CODEX_USAGE_LABEL="duel-arbiter" CODEX_BRIDGE_DIR="$adir" bash "$BRIDGE" consult < "$pfile" > "$TASK_DIR/arbiter.log" 2>&1 & _apid=$!
+  run_claude_once "$TASK_DIR/arbiter_claude.md" "$TASK_DIR/arbiter_claude.log" prompt_arbiter duel-arbiter-claude \
+    || echo "codex_loop: WARNING: Claude arbiter failed — panel degrades to the Codex ruling alone" >&2
+  wait "$_apid"; rc=$?
   if [ -f "$adir/last_message.md" ]; then
     cp "$adir/last_message.md" "$TASK_DIR/arbiter.md"
   fi
-  journal "duel arbiter rc=$rc -> arbiter.md"
-  [ "$rc" -ne 0 ] && echo "codex_loop: WARNING: arbiter call failed (rc=$rc); see arbiter.log" >&2
+  journal "duel arbiter panel: codex rc=$rc, claude $([ -s "$TASK_DIR/arbiter_claude.md" ] && echo ok || echo failed)"
+  [ "$rc" -ne 0 ] && echo "codex_loop: WARNING: Codex arbiter call failed (rc=$rc); see arbiter.log" >&2
   return 0
 }
 
@@ -1281,7 +1906,10 @@ run_arbiter() {
 # thread in-session). Runs even on non-convergence; enumerates UNRESOLVED points
 # and weighs the fresh-context arbiter's rulings when present.
 finalize_and_report() {
-  [ "$END_REASON" = "both-converged" ] || run_arbiter
+  case "$END_REASON" in
+    both-converged|converged-post-redteam) ;;   # survived scrutiny — no arbiter needed
+    *) run_arbiter ;;
+  esac
   if [ -f "$SID_FILE" ] && [ "$DRY_RUN" -eq 0 ]; then
     local sid pfile; sid="$(cat "$SID_FILE" 2>/dev/null)"
     if [ -n "$sid" ]; then
@@ -1291,9 +1919,20 @@ finalize_and_report() {
       {
         printf 'The debate is over (end reason: %s). Produce the FINAL combined, cross-checked answer:\n' "$END_REASON"
         printf 'merge where you and Codex agree; for EACH remaining disagreement state both positions and your adjudication under a "## UNRESOLVED" heading. Output the answer only.\n'
-        if [ -s "$TASK_DIR/arbiter.md" ]; then
-          printf '\nAn INDEPENDENT fresh-context arbiter (no stake in the debate) ruled on the remaining disagreements — weigh its rulings seriously and say when you overrule one and why:\n=== ARBITER RULINGS ===\n'
-          truncate_bytes "$TASK_DIR/arbiter.md" "$MAX_BYTES"
+        if [ -s "$TASK_DIR/arbiter.md" ] || [ -s "$TASK_DIR/arbiter_claude.md" ]; then
+          printf '\nAn INDEPENDENT two-model arbiter panel (fresh context, no stake, anonymized docket) ruled on the remaining disagreements. Where the two rulings AGREE, treat the ruling as binding absent NEW checkable evidence (state explicitly if you overrule one, and why); where they DISAGREE, the point goes under "## UNRESOLVED" with both rulings shown.\n'
+          if [ -s "$TASK_DIR/arbiter.md" ]; then
+            printf '=== ARBITER RULING 1 ===\n'
+            truncate_bytes "$TASK_DIR/arbiter.md" "$MAX_BYTES"
+          fi
+          if [ -s "$TASK_DIR/arbiter_claude.md" ]; then
+            printf '\n=== ARBITER RULING 2 ===\n'
+            truncate_bytes "$TASK_DIR/arbiter_claude.md" "$MAX_BYTES"
+          fi
+        fi
+        if [ -s "$TASK_DIR/citefail-claude.md" ] || [ -s "$TASK_DIR/citefail-codex.md" ]; then
+          printf '\n=== FAILED CITATIONS (mechanically checked — the final answer must not rest on these) ===\n'
+          cat "$TASK_DIR/citefail-claude.md" "$TASK_DIR/citefail-codex.md" 2>/dev/null
         fi
       } > "$pfile"
       local frc
@@ -1360,39 +1999,99 @@ run_duel_auto() {
     "$TASK_ID" "$([ "$CODE" -eq 1 ] && echo on || echo off)" "$ROUNDS" \
     "$CODEX_MODEL" "$CODEX_EFFORT" "$(claude_effort)" >> "$TRANSCRIPT"
 
-  local r rc
+  local r crc xrc rc
   printf '0\n' > "$ROUND_FILE"
 
   # Round 0: both sides INDEPENDENT — no cross-feed, so their errors stay
-  # uncorrelated and the critique rounds have real signal to work with.
-  echo "=== round 0: claude (independent) ==="
-  run_claude_turn 0 set claude_stdin_round0; rc=$?
-  if [ "$rc" -ne 0 ]; then note_partial claude 0 "$rc"; finalize_and_report; return 1; fi
+  # uncorrelated and the critique rounds have real signal to work with. The two
+  # turns share no state (disjoint files; the bridge confines Codex state to
+  # BRIDGE_DIR), so run them CONCURRENTLY — halves round-0 latency for free.
+  echo "=== round 0: claude + codex (independent, parallel) ==="
+  run_claude_turn 0 set claude_stdin_round0 & _cpid=$!
+  run_codex_turn 0 0 ""
+  xrc=$?
+  wait "$_cpid"; crc=$?
+  if [ "$crc" -ne 0 ]; then note_partial claude 0 "$crc"; finalize_and_report; return 1; fi
+  if [ "$xrc" -ne 0 ]; then note_partial codex 0 "$xrc"; finalize_and_report; return 1; fi
   append_transcript CLAUDE 0 "$ROUNDS_DIR/00-claude.md"
-
-  echo "=== round 0: codex (independent) ==="
-  run_codex_turn 0 0 ""; rc=$?
-  if [ "$rc" -ne 0 ]; then note_partial codex 0 "$rc"; finalize_and_report; return 1; fi
   append_transcript CODEX 0 "$ROUNDS_DIR/00-codex.md"
+  duel_post_turn claude 0
+  duel_post_turn codex 0
   printf '1\n' > "$ROUND_FILE"
   # NOTE: no convergence check after round 0 — CONVERGED cannot mean anything
   # before the two sides have actually seen each other's positions.
 
-  for r in $(seq 1 $((ROUNDS - 1))); do
-    echo "=== round $r: claude ==="
-    run_claude_turn "$r" resume claude_stdin_resume; rc=$?
+  # Cross-critique rounds. RT_ROUND marks the one red-team falsification
+  # exchange granted before a first convergence is honored (it may exceed the
+  # round cap by exactly one); stall detection hands hardened disagreements to
+  # the arbiter early instead of burning identical rounds.
+  local maxr=$((ROUNDS - 1)) rt_round=0 prev_open_c="" prev_open_x="" cur_open_c cur_open_x
+  r=1
+  while [ "$r" -le "$maxr" ]; do
+    if [ "$rt_round" -eq 1 ]; then
+      echo "=== round $r: claude (RED TEAM — attack the consensus) ==="
+      run_claude_turn "$r" resume claude_stdin_redteam; rc=$?
+    else
+      echo "=== round $r: claude ==="
+      run_claude_turn "$r" resume claude_stdin_resume; rc=$?
+    fi
     if [ "$rc" -ne 0 ]; then note_partial claude "$r" "$rc"; finalize_and_report; return 1; fi
     append_transcript CLAUDE "$r" "$ROUNDS_DIR/$(rr "$r")-claude.md"
+    duel_post_turn claude "$r"
 
-    echo "=== round $r: codex ==="
-    run_codex_turn "$r" 1 "$ROUNDS_DIR/$(rr "$r")-claude.md"; rc=$?
+    if [ "$rt_round" -eq 1 ]; then
+      echo "=== round $r: codex (RED TEAM — attack the consensus) ==="
+      run_codex_turn "$r" 1 "$ROUNDS_DIR/$(rr "$r")-claude.md" redteam; rc=$?
+    else
+      echo "=== round $r: codex ==="
+      run_codex_turn "$r" 1 "$ROUNDS_DIR/$(rr "$r")-claude.md"; rc=$?
+    fi
     if [ "$rc" -ne 0 ]; then note_partial codex "$r" "$rc"; finalize_and_report; return 1; fi
     append_transcript CODEX "$r" "$ROUNDS_DIR/$(rr "$r")-codex.md"
+    duel_post_turn codex "$r"
     printf '%s\n' "$((r + 1))" > "$ROUND_FILE"
 
     if round_converged "$r"; then
-      END_REASON="both-converged"; finalize_and_report; return 0
+      if [ "$rt_round" -eq 1 ]; then
+        END_REASON="converged-post-redteam"
+        finalize_and_report
+        return 0
+      fi
+      if [ "$REDTEAM_DONE" != 1 ]; then
+        REDTEAM_DONE=1
+        save_duel_env
+        rt_round=1
+        maxr=$((r + 1))   # grant exactly one extra exchange, even past the cap
+        journal "red-team: consensus at round $r — one falsification exchange before it stands"
+        r=$((r + 1))
+        continue
+      fi
+      END_REASON="both-converged"
+      finalize_and_report
+      return 0
     fi
+
+    if [ "$rt_round" -eq 1 ]; then
+      # The attack landed: points reopened — resume the normal loop within the
+      # original cap.
+      rt_round=0
+      maxr=$((ROUNDS - 1))
+      journal "red-team: attack reopened points at round $r — debate continues"
+    else
+      # Stall: both OPEN sets unchanged round-over-round means more debate will
+      # not move them — hand the transcript to the arbiter now.
+      cur_open_c="$(dx_ids "$ROUNDS_DIR/$(rr "$r")-claude.md" OPEN | tr '\n' ' ')"
+      cur_open_x="$(dx_ids "$ROUNDS_DIR/$(rr "$r")-codex.md" OPEN | tr '\n' ' ')"
+      if [ -n "$cur_open_c$cur_open_x" ] && [ "$cur_open_c" = "$prev_open_c" ] && [ "$cur_open_x" = "$prev_open_x" ]; then
+        journal "stall: OPEN sets unchanged at round $r — early arbiter"
+        END_REASON="stalled-disagreement"
+        finalize_and_report
+        return 0
+      fi
+      prev_open_c="$cur_open_c"
+      prev_open_x="$cur_open_x"
+    fi
+    r=$((r + 1))
   done
 
   END_REASON="round-cap"
@@ -1436,11 +2135,14 @@ run_duel_mode() {
       printf '  transcript: %s/transcript.md\n  prompt:     %s/prompt.md\n' "$TASK_DIR_REL" "$TASK_DIR_REL"
       printf 'Each round, you (live Claude) do:\n'
       printf '  1. Do your own research/critique; write your turn to %s/claude_latest.md\n' "$TASK_DIR_REL"
-      printf '     (share ALL evidence — file:line, URLs, test results; end with "DISAGREEMENTS REMAINING: <n>")\n'
+      printf '     - maintain the DX ledger: "- DX-01 | OPEN|AGREED|CONCEDED-CLAUDE|CONCEDED-CODEX | <point> | evidence: <path:line or URL>" + "TOTAL OPEN: <n>"\n'
+      printf '     - cite evidence as: EVIDENCE: <path>:<line> "<verbatim quote>" (citations are mechanically verified)\n'
+      printf '     - concede ONLY on new evidence, never to be agreeable\n'
       printf '  2. Run one Codex turn:\n       bash codex-bridge/codex_loop.sh --mode duel --task %s --step codex\n' "$TASK_ID"
       printf '  3. Read %s/codex_latest.md; critique/adopt; repeat until converged or %s rounds.\n' "$TASK_DIR_REL" "$ROUNDS"
-      printf '     When you agree with Codex and n=0, make the SINGLE line %s the LAST line of claude_latest.md.\n' "$CONV_TOKEN"
+      printf '     When you agree AND your ledger has zero OPEN points, make the SINGLE line %s the LAST line of claude_latest.md.\n' "$CONV_TOKEN"
       printf '  4. Finish: bash codex-bridge/codex_loop.sh --mode duel --task %s --step finalize\n' "$TASK_ID"
+      printf '     (first convergence triggers ONE mandatory red-team attack round; --force-finalize skips it)\n'
       return 0
       ;;
     codex)
@@ -1453,6 +2155,7 @@ run_duel_mode() {
       cp "$CLAUDE_LATEST" "$ROUNDS_DIR/$(rr "$r")-claude.md" 2>/dev/null || true
 
       resume=0; [ "$r" -gt 0 ] && resume=1
+      duel_post_turn claude "$r"
       echo "=== round $r: codex ==="
       run_codex_turn "$r" "$resume" "$ROUNDS_DIR/$(rr "$r")-claude.md"; rc=$?
       if [ "$rc" -ne 0 ]; then
@@ -1463,6 +2166,7 @@ run_duel_mode() {
       fi
       append_transcript CLAUDE "$r" "$ROUNDS_DIR/$(rr "$r")-claude.md"
       append_transcript CODEX "$r" "$ROUNDS_DIR/$(rr "$r")-codex.md"
+      duel_post_turn codex "$r"
       printf '%s\n' "$((r + 1))" > "$ROUND_FILE"
       # Consume the Claude turn: an accidental repeat of '--step codex' must not
       # silently burn a round re-feeding Codex the same stale message.
@@ -1470,8 +2174,15 @@ run_duel_mode() {
 
       echo "----- CODEX (round $r) -> $TASK_DIR_REL/codex_latest.md -----"
       cat "$CODEX_LATEST"
-      if converged_side "$CODEX_LATEST"; then
-        echo "----- Codex signalled $CONV_TOKEN. If you also converge, end your next claude_latest.md with the single line $CONV_TOKEN and run '--step finalize'. -----"
+      if [ -s "$TASK_DIR/citefail-codex.md" ]; then
+        echo "----- CITATION CHECK: these Codex citations did NOT verify — treat as unproven: -----"
+        cat "$TASK_DIR/citefail-codex.md"
+      fi
+      if [ -s "$TASK_DIR/nudge-claude.md" ]; then
+        echo "----- YOUR LEDGER dropped these OPEN points without resolution — restate or resolve them next turn: $(tr '\n' ' ' < "$TASK_DIR/nudge-claude.md") -----"
+      fi
+      if side_settled "$CODEX_LATEST"; then
+        echo "----- Codex signalled $CONV_TOKEN with zero OPEN points. If you also converge, end your next claude_latest.md with the single line $CONV_TOKEN (ledger all AGREED/CONCEDED) and run '--step finalize'. -----"
       fi
       if [ "$((r + 1))" -ge "$ROUNDS" ]; then
         echo "----- round cap ($ROUNDS) reached; run '--step finalize'. -----"
@@ -1483,8 +2194,27 @@ run_duel_mode() {
       local lastc lastx
       lastc="$(ls "$ROUNDS_DIR"/*-claude.md 2>/dev/null | tail -1)"
       lastx="$(ls "$ROUNDS_DIR"/*-codex.md 2>/dev/null | tail -1)"
-      if [ -n "$lastc" ] && [ -n "$lastx" ] && converged_side "$lastc" && converged_side "$lastx"; then
-        END_REASON="both-converged"
+      if [ -n "$lastc" ] && [ -n "$lastx" ] && side_settled "$lastc" && side_settled "$lastx"; then
+        # Red-team gate: a first convergence gets ONE mandatory falsification
+        # exchange before it stands (sycophantic capitulation is the dominant
+        # debate failure mode). --force-finalize overrides.
+        if [ "$REDTEAM_DONE" != 1 ] && [ "$FORCE_FINALIZE" -eq 0 ]; then
+          REDTEAM_DONE=1
+          save_duel_env
+          printf 'RED-TEAM GATE: you both converged, but the consensus has not been attacked yet.\n'
+          printf 'Do ONE falsification exchange before finalizing:\n'
+          printf '  1. Write an ATTACK turn to %s/claude_latest.md: hunt failure scenarios, counter-examples,\n' "$TASK_DIR_REL"
+          printf '     contrary evidence (cite per the evidence grammar). Re-converging after a failed attack\n'
+          printf '     is the correct outcome — if every attack fails, keep %s as the last line.\n' "$CONV_TOKEN"
+          printf '  2. Run: bash codex-bridge/codex_loop.sh --mode duel --task %s --step codex\n' "$TASK_ID"
+          printf '  3. Then run finalize again. (Skip this gate with --force-finalize.)\n'
+          return 0
+        fi
+        if [ "$REDTEAM_DONE" = 1 ] && [ "$FORCE_FINALIZE" -eq 0 ]; then
+          END_REASON="converged-post-redteam"
+        else
+          END_REASON="both-converged"
+        fi
       else
         END_REASON="round-cap"
         run_arbiter
@@ -1495,8 +2225,9 @@ run_duel_mode() {
       printf '\nNEXT (you, live Claude): author the converged, cross-checked answer to\n'
       printf '  %s/final.md  — merge where you and Codex agree; under "## UNRESOLVED"\n' "$TASK_DIR_REL"
       printf '  state both positions + your adjudication for each remaining disagreement.\n'
-      if [ -s "$TASK_DIR/arbiter.md" ]; then
-        printf '  A fresh-context arbiter ruled on the open points: weigh %s/arbiter.md and say when you overrule it.\n' "$TASK_DIR_REL"
+      if [ -s "$TASK_DIR/arbiter.md" ] || [ -s "$TASK_DIR/arbiter_claude.md" ]; then
+        printf '  A two-model arbiter panel ruled on the open points (%s/arbiter.md + arbiter_claude.md):\n' "$TASK_DIR_REL"
+        printf '  where the rulings AGREE treat them as binding absent new evidence; where they DISAGREE, list the point under ## UNRESOLVED with both rulings.\n'
       fi
       if [ "$CODE" -eq 1 ]; then
         printf '  Codex edits are in %s (git -C %s diff %s). Cherry-pick into main if desired;\n' "$DUEL_WORKTREE" "$DUEL_WORKTREE" "$BASE"

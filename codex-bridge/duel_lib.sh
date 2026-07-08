@@ -52,3 +52,92 @@ mint_claude_sid() {
     || powershell.exe -NoProfile -Command "[guid]::NewGuid().ToString()" 2>/dev/null; } \
     | tr -d '\r\n'
 }
+
+# ---------------------------------------------------------------------------
+# DX disagreement-ledger parsers (duel). Ledger grammar, one line per point:
+#   - DX-01 | OPEN|AGREED|CONCEDED-CLAUDE|CONCEDED-CODEX | <one-line> | evidence: <path:line or URL>
+# ending with 'TOTAL OPEN: <n>'. Tolerant of **bold**/`backtick` markers and CRLF.
+# ---------------------------------------------------------------------------
+
+# All DX ledger lines, CR-stripped, bullets/markdown markers removed.
+dx_lines() {
+  [ -f "$1" ] || return 0
+  tr -d '\r' < "$1" | grep -aE '^[[:space:]]*[-*][[:space:]]*(\*\*|`)?DX-[0-9]+' \
+    | sed -e 's/[*`]//g' -e 's/^[[:space:]]*[-*][[:space:]]*//'
+}
+
+# Unique DX ids in a file; optional 2nd arg filters by status field.
+dx_ids() {
+  if [ -n "${2:-}" ]; then
+    dx_lines "$1" | grep -E "\|[[:space:]]*${2}[[:space:]]*\|" | grep -oE '^DX-[0-9]+'
+  else
+    dx_lines "$1" | grep -oE '^DX-[0-9]+'
+  fi | sort -u
+}
+
+dx_open_count() { dx_ids "$1" OPEN | grep -c . || true; }
+
+# Ids that were OPEN in $1 (previous turn) but VANISHED entirely from $2
+# (current turn) — points silently dropped without a terminal status.
+dx_vanished() {
+  local prev="$1" cur="$2" id
+  [ -f "$prev" ] || return 0
+  for id in $(dx_ids "$prev" OPEN); do
+    dx_ids "$cur" | grep -qx "$id" || echo "$id"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# CX findings-ledger lint (guard/build reviews). Expected grammar per line:
+#   - [ ] CX-NN | BLOCKER|MAJOR|MINOR | <file>:<line> | <one-line summary>
+# ending with 'TOTAL: <n>'. Prints one violation per line; silent when clean.
+# ---------------------------------------------------------------------------
+lint_findings() {
+  local f="$1" root="${2:-.}" n=0
+  [ -f "$f" ] || { echo "findings file missing: $f"; return 0; }
+  local line id nfields sev loc path lno flen
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    printf '%s' "$line" | grep -qE '^[[:space:]]*-[[:space:]]*\[.\][[:space:]]*(\*\*|`)?CX-[0-9]+' || continue
+    n=$((n + 1))
+    id="$(printf '%s' "$line" | grep -oE 'CX-[0-9]+' | head -1)"
+    nfields="$(printf '%s' "$line" | awk -F'|' '{print NF}')"
+    if [ "$nfields" -lt 4 ]; then
+      echo "$id: expected 4 pipe-separated fields (id | severity | file:line | summary)"
+      continue
+    fi
+    sev="$(printf '%s' "$line" | awk -F'|' '{gsub(/[* `]/, "", $2); print $2}')"
+    case "$sev" in
+      BLOCKER|MAJOR|MINOR) ;;
+      *) echo "$id: severity '$sev' is not BLOCKER|MAJOR|MINOR" ;;
+    esac
+    loc="$(printf '%s' "$line" | awk -F'|' '{gsub(/^[ ]+|[ ]+$/, "", $3); gsub(/[*`]/, "", $3); print $3}')"
+    path="${loc%%:*}"
+    lno="${loc##*:}"
+    if [ -n "$path" ]; then
+      if [ ! -f "$root/$path" ]; then
+        echo "$id: file not found: $path"
+      elif [ "$lno" != "$loc" ] && printf '%s' "$lno" | grep -qE '^[0-9]+$'; then
+        flen="$(wc -l < "$root/$path" 2>/dev/null || echo 0)"
+        [ "$lno" -le "$((flen + 1))" ] || echo "$id: line $lno beyond end of $path ($flen lines)"
+      fi
+    fi
+  done < "$f"
+  local total
+  total="$(tr -d '\r' < "$f" | grep -aoE 'TOTAL: *[0-9]+' | tail -1 | grep -oE '[0-9]+')"
+  if [ -z "$total" ]; then
+    echo "missing 'TOTAL: <n>' line"
+  elif [ "$total" -ne "$n" ]; then
+    echo "TOTAL says $total but $n CX line(s) found"
+  fi
+}
+
+# CX ids present in the findings ledger ($1) but missing a ruling in the
+# reconciliation file ($2) — the completeness gate for guard verify.
+recon_missing() {
+  local findings="$1" recon="$2" id
+  [ -f "$findings" ] || return 0
+  for id in $(tr -d '\r' < "$findings" 2>/dev/null | grep -oE 'CX-[0-9]+' | sort -u); do
+    tr -d '\r' < "$recon" 2>/dev/null | grep -qE "${id}([^0-9]|\$)" || echo "$id"
+  done
+}
