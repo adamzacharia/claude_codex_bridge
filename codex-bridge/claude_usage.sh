@@ -18,8 +18,6 @@
 # window while codex_loop.sh happened to be running.
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-
 CMD="${1:-}"
 TASK="${2:-}"
 LABEL="${3:-interactive}"

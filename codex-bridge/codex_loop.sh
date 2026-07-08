@@ -593,7 +593,7 @@ prompt_build_verify() {
 
 prompt_codex_reopen() {
   printf 'The cross-reviewer verified your fixes and REOPENED the findings below — your fix was judged cosmetic, incomplete, or regressive. Address ONLY these, for real this time; if you still believe one is wrong, give a NEW argument (the old one was already rejected).\n\n'
-  printf 'REOPENED: %s\n\n' "$(cat "$TASK_DIR/reopened.txt" 2>/dev/null | tr '\n' ' ')"
+  printf 'REOPENED: %s\n\n' "$(tr '\n' ' ' < "$TASK_DIR/reopened.txt" 2>/dev/null)"
   printf '=== REVIEWER VERDICT ===\n'
   truncate_bytes "$TASK_DIR/build_verify.md" "$MAX_BYTES"
   printf '\n\n%s\n\n' "$SHARE_LINE"

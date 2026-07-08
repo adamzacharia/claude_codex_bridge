@@ -21,8 +21,11 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # -S warning: fail only on warnings/errors. Info/style notes (SC2015
+          # A&&B||C guards, SC2016 backticks inside prompt text, SC2012 ls on
+          # fixed-format round files) are deliberate idioms in this kit.
           # SC1091: sourced files resolved at runtime next to the script.
-          shellcheck -x -e SC1091 codex-bridge/*.sh install.sh
+          shellcheck -x -S warning -e SC1091 codex-bridge/*.sh install.sh
 
       - name: bats unit tests
         run: |
